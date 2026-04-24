@@ -18,7 +18,8 @@ This extension enables **large image drawing & upscaling with limited VRAM** via
 
 - [x] Supported models
     - [x] SD1.x, SD2.x, SDXL, SD3
-    - [x] FLUX
+    - [x] FLUX (with Flux-specific RoPE patch — see [DiT/Flux Enhancements](#ditflux-enhancements))
+    - [x] FLUX.2 / FLUX.2 Klein (T2I + I2I with reference latent)
 - [x] ControlNet support
 - [ ] ~~StableSR support~~
 - [ ] ~~Tiled Noise Inversion~~
@@ -26,6 +27,7 @@ This extension enables **large image drawing & upscaling with limited VRAM** via
 - [ ] Regional Prompt Control
 - [x] Img2img upscale
 - [x] Ultra-Large image generation
+- [x] Edit-model reference latent passthrough (Flux Kontext, Flux.2, chain with `ReferenceLatent`)
 
 ## Tiled Diffusion
 
@@ -47,6 +49,8 @@ This extension enables **large image drawing & upscaling with limited VRAM** via
 | `tile_height`     | Tile's height                                                |
 | `tile_overlap`    | Tile's overlap                                               |
 | `tile_batch_size` | The number of tiles to process in a batch                    |
+| `rope_patch`      | *(optional, Flux/DiT)* `auto` \| `enable` \| `disable`. Global RoPE per-tile rewrite. `auto` turns on for Flux-like models so each tile keeps its absolute canvas coordinates, fixing seams caused by RoPE restarting at (0,0) on every tile. Forces `tile_batch_size=1`. Default: `auto`. |
+| `rope_scale`      | *(optional, Flux/DiT)* Static DyPE-style RoPE frequency scale. Set >1 when rendering above training resolution (e.g. `2.0` for 2×, `1.5` for 1.5×). Composes with an external DyPE node if present (won't override). Default: `1.0` (off). |
 
 ### How can I specify the tiles' arrangement?
 
@@ -59,6 +63,28 @@ If you have the [Math Expression](https://github.com/pythongosssss/ComfyUI-Custo
 `pixel height of input image or latent // R` = `tile_height`
 
 <img width="800" alt="Tile_arrangement" src="https://github.com/shiimizu/ComfyUI-TiledDiffusion/assets/54494639/9952e7d8-909e-436f-a284-c00f0fb71665">
+
+### DiT/Flux Enhancements
+
+UNet-era tiled diffusion treats the model as a black box and only splits latents spatially. That breaks for Diffusion Transformers (Flux, Flux.2, SD3) because:
+
+1. **RoPE seams** — each transformer block uses Rotary Position Embedding over patch coordinates. When a tile is processed independently, its RoPE restarts at `(0, 0)`, so two neighbouring tiles believe they are each "the whole image starting at the top-left corner". Result: visible seams and duplicated structures at tile boundaries.
+2. **List-of-tensor conditioning** — edit-model conditioning (`reference_latents` for Flux Kontext / Flux.2 Klein / Qwen-Image-Edit) is carried as a Python list of tensors, not a 4-D tensor. The old loop only broadcast `torch.Tensor` items, so reference latents kept their original batch and `torch.cat([img, kontext], dim=1)` in `comfy/ldm/flux/model.py` exploded with *"Expected size 2 but got size 1"*.
+3. **Reference tiling** — when reference and target share spatial size (typical I2I), tiling the target but keeping the reference full-size forces every tile to re-attend over the whole reference. Inference time barely drops versus full-image.
+
+This fork addresses all three for any model that exposes `process_img` (Flux, Flux.2, Flux.2 Klein, Flux Kontext):
+
+- **Global RoPE per tile** — the wrapper sets `transformer_options["rope_options"]` with `shift_y = bbox.y / patch_size` and `shift_x = bbox.x / patch_size` before each forward call. `comfy/ldm/flux/model.py` already reads these keys (see `process_img`), so each tile emits `img_ids` describing its absolute position on the global canvas and RoPE stays coherent across the full image. Controlled by `rope_patch` (default `auto`; set to `disable` for exact legacy behaviour).
+- **List-of-tensor conditioning support** — the `c_in` loop now handles `list[torch.Tensor]` values alongside plain tensors. Reference latents are broadcast to the tile batch exactly like other conditioning tensors, so edit workflows stop crashing.
+- **Spatial reference tiling** — when a reference tensor in a list shares spatial dimensions with the target latent, it is sliced with the same bboxes as the target. Each tile only attends to the aligned region of its reference. Smaller references (e.g. 1024² guidance for 2048² output) fall back to broadcast-only (reference stays global), which preserves the previous behaviour for non-aligned references.
+- **Static DyPE-style RoPE scaling** — the optional `rope_scale` input stretches positional frequencies when rendering above training resolution, so 2× and 3× upscales retain structure instead of devolving into repetition. Composes with per-tile shift: if an external DyPE node has already set `scale_x` / `scale_y`, the per-tile shift is automatically rescaled to land on the correct (scaled) global canvas coordinates.
+
+**Caveat**: `rope_patch` enabled forces `tile_batch_size = 1` because `transformer_options` is shared across a forward call — per-sample `rope_options` is not representable otherwise. On non-Flux models (SD 1.5 / 2.x / SDXL / SD3) the feature is off by default and behaviour is identical to the original extension.
+
+**Usage tips**:
+- Flux.2 Klein I2I: chain `ReferenceLatent` → your positive conditioning, then `TiledDiffusion` on the model with `rope_patch=auto`. Use `Mixture of Diffusers` for the smoothest blend.
+- Rendering 2× training resolution: set `rope_scale=2.0`. For other multipliers, use `rope_scale ≈ output_res / training_res`.
+- Stack with external speed optimisations (Nunchaku SVDQuant, EasyCache/MagCache, SageAttention) — all orthogonal and compose cleanly.
 
 ### SpotDiffusion
 
