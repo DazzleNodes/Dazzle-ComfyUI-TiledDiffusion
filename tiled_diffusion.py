@@ -158,6 +158,10 @@ class AbstractDiffusion:
         # Requires tile_batch_size=1 (one bbox per forward call).
         self.rope_per_tile: bool = False
         self.patch_size: int = 2
+        # Static DyPE-style RoPE scale (>1 stretches positional frequencies to help
+        # pretrained models generate above training resolution). Applied only if
+        # an external DyPE node hasn't already set scale_x/scale_y.
+        self.rope_scale: float = 1.0
 
     def reset(self):
         tile_width = self.tile_width
@@ -216,8 +220,12 @@ class AbstractDiffusion:
         """
         For Flux/DiT tiled sampling: set transformer_options["rope_options"] so the
         model's process_img() uses absolute canvas patch coordinates for this tile
-        instead of restarting RoPE at (0,0). Shift is converted to patch units.
-        Mutates c_tile in-place.
+        instead of restarting RoPE at (0,0).
+
+        Composes with external RoPE scaling (e.g. DyPE): when scale_x/scale_y are
+        already set (by an upstream DyPE node or self.rope_scale), the per-tile
+        shift is multiplied by the scale so absolute patch positions match the
+        scaled global canvas. Shift is additive to any existing shift.
         """
         if not self.rope_per_tile:
             return
@@ -226,10 +234,22 @@ class AbstractDiffusion:
         tf = dict(tf) if isinstance(tf, dict) else {}
         existing = tf.get('rope_options', None)
         rope_opts = dict(existing) if isinstance(existing, dict) else {}
-        # bbox.x / bbox.y are in latent space; Flux's process_img divides by patch_size
-        # internally for its own h_offset arg but adds shift_x/shift_y in patch space.
-        rope_opts['shift_y'] = float(bbox.y) / ps + rope_opts.get('shift_y', 0.0)
-        rope_opts['shift_x'] = float(bbox.x) / ps + rope_opts.get('shift_x', 0.0)
+
+        # Static built-in DyPE-style scale (Tier 2): applied uniformly on both axes
+        # if the user set self.rope_scale > 1.0 (e.g. rendering at 2x training res).
+        # Does not override an external scale already present.
+        if self.rope_scale != 1.0 and 'scale_x' not in rope_opts and 'scale_y' not in rope_opts:
+            rope_opts['scale_x'] = float(self.rope_scale)
+            rope_opts['scale_y'] = float(self.rope_scale)
+
+        scale_y = float(rope_opts.get('scale_y', 1.0))
+        scale_x = float(rope_opts.get('scale_x', 1.0))
+
+        # bbox.y/x are latent coords; divide by patch_size to get patch coords,
+        # then multiply by scale so absolute positions stay consistent with the
+        # (scaled) global canvas that DyPE/scale_* is simulating.
+        rope_opts['shift_y'] = float(bbox.y) / ps * scale_y + rope_opts.get('shift_y', 0.0)
+        rope_opts['shift_x'] = float(bbox.x) / ps * scale_x + rope_opts.get('shift_x', 0.0)
         tf['rope_options'] = rope_opts
         c_tile['transformer_options'] = tf
 
@@ -911,6 +931,7 @@ class TiledDiffusion():
                             },
                 "optional": {
                                 "rope_patch": (["auto", "enable", "disable"], {"default": "auto", "tooltip": "Flux/DiT global RoPE per-tile rewrite. 'auto' enables for Flux models to fix seams. Forces tile_batch_size=1."}),
+                                "rope_scale": ("FLOAT", {"default": 1.0, "min": 0.25, "max": 4.0, "step": 0.05, "tooltip": "DyPE-style RoPE frequency scale. Set >1 when rendering above training resolution (e.g. 2.0 for 2x training res on Flux). 1.0 = off. Composes with per-tile shift. Ignored if an external DyPE node already sets scale_x/scale_y."}),
                             }}
     RETURN_TYPES = ("MODEL",)
     FUNCTION = "apply"
@@ -926,7 +947,7 @@ class TiledDiffusion():
     def __init__(self) -> None:
         self.__class__.instances.add(self)
 
-    def apply(self, model: ModelPatcher, method, tile_width, tile_height, tile_overlap, tile_batch_size, rope_patch="auto"):
+    def apply(self, model: ModelPatcher, method, tile_width, tile_height, tile_overlap, tile_batch_size, rope_patch="auto", rope_scale=1.0):
         if method == "Mixture of Diffusers":
             self.impl = MixtureOfDiffusers()
         elif method == "MultiDiffusion":
@@ -951,11 +972,14 @@ class TiledDiffusion():
 
         self.impl.rope_per_tile = enable_rope
         self.impl.patch_size = getattr(diffusion_model, 'patch_size', 2) if diffusion_model is not None else 2
+        self.impl.rope_scale = float(rope_scale)
 
         # rope_per_tile requires one bbox per forward call so rope_options can differ per tile.
         effective_batch_size = 1 if enable_rope else tile_batch_size
         if enable_rope and tile_batch_size != 1:
             print(f"[TiledDiffusion] Flux/DiT RoPE patch enabled: forcing tile_batch_size=1 (was {tile_batch_size}) for per-tile global RoPE coordinates.")
+        if enable_rope and float(rope_scale) != 1.0:
+            print(f"[TiledDiffusion] RoPE scale = {rope_scale} (DyPE-style frequency stretch; set to 1.0 to disable).")
 
         self.impl.tile_width = tile_width // compression
         self.impl.tile_height = tile_height // compression
