@@ -212,6 +212,27 @@ class AbstractDiffusion:
             self.x_buffer.zero_()
 
     @grid_bbox
+    def _inject_rope_options(self, c_tile: dict, bbox: 'BBox') -> None:
+        """
+        For Flux/DiT tiled sampling: set transformer_options["rope_options"] so the
+        model's process_img() uses absolute canvas patch coordinates for this tile
+        instead of restarting RoPE at (0,0). Shift is converted to patch units.
+        Mutates c_tile in-place.
+        """
+        if not self.rope_per_tile:
+            return
+        ps = max(1, int(self.patch_size))
+        tf = c_tile.get('transformer_options', None)
+        tf = dict(tf) if isinstance(tf, dict) else {}
+        existing = tf.get('rope_options', None)
+        rope_opts = dict(existing) if isinstance(existing, dict) else {}
+        # bbox.x / bbox.y are in latent space; Flux's process_img divides by patch_size
+        # internally for its own h_offset arg but adds shift_x/shift_y in patch space.
+        rope_opts['shift_y'] = float(bbox.y) / ps + rope_opts.get('shift_y', 0.0)
+        rope_opts['shift_x'] = float(bbox.x) / ps + rope_opts.get('shift_x', 0.0)
+        tf['rope_options'] = rope_opts
+        c_tile['transformer_options'] = tf
+
     def init_grid_bbox(self, tile_w:int, tile_h:int, overlap:int, tile_bs:int):
         # if self._init_grid_bbox is not None: return
         # self._init_grid_bbox = True
@@ -547,6 +568,10 @@ class MultiDiffusion(AbstractDiffusion):
                 # stablesr tiling
                 # self.switch_stablesr_tensors(batch_id)
 
+                # Flux/DiT global RoPE per-tile (requires tile_batch_size=1).
+                if self.rope_per_tile and len(bboxes) == 1:
+                    self._inject_rope_options(c_tile, bboxes[0])
+
                 x_tile_out = model_function(x_tile, t_tile, **c_tile)
 
                 for i, bbox in enumerate(bboxes):
@@ -713,6 +738,12 @@ class SpotDiffusion(AbstractDiffusion):
                 # stablesr tiling
                 # self.switch_stablesr_tensors(batch_id)
 
+                # Flux/DiT global RoPE per-tile (requires tile_batch_size=1).
+                # SpotDiffusion rolls x_in before tiling, so rope shift is based on the
+                # rolled bbox position (which equals bbox.x/y since slicer is post-roll).
+                if self.rope_per_tile and len(bboxes) == 1:
+                    self._inject_rope_options(c_tile, bboxes[0])
+
                 x_tile_out = model_function(x_tile, t_tile, **c_tile)
 
                 for i, bbox in enumerate(bboxes):
@@ -839,9 +870,13 @@ class MixtureOfDiffusers(AbstractDiffusion):
                 if 'control' in c_in:
                     self.process_controlnet(x_tile, c_in, cond_or_uncond, bboxes, N, batch_id)
                     c_tile['control'] = c_in['control'].get_control_orig(x_tile, t_tile, c_tile, len(cond_or_uncond), c_in['transformer_options'])
-                
+
                 # stablesr
                 # self.switch_stablesr_tensors(batch_id)
+
+                # Flux/DiT global RoPE per-tile (requires tile_batch_size=1).
+                if self.rope_per_tile and len(bboxes) == 1:
+                    self._inject_rope_options(c_tile, bboxes[0])
 
                 # denoising: here the x is the noise
                 x_tile_out = model_function(x_tile, t_tile, **c_tile)
@@ -873,6 +908,9 @@ class TiledDiffusion():
                                 "tile_height": ("INT", {"default": 96*opt_f, "min": 16, "max": MAX_RESOLUTION, "step": 16}),
                                 "tile_overlap": ("INT", {"default": 8*opt_f, "min": 0, "max": 256*opt_f, "step": 4*opt_f}),
                                 "tile_batch_size": ("INT", {"default": 4, "min": 1, "max": MAX_RESOLUTION, "step": 1}),
+                            },
+                "optional": {
+                                "rope_patch": (["auto", "enable", "disable"], {"default": "auto", "tooltip": "Flux/DiT global RoPE per-tile rewrite. 'auto' enables for Flux models to fix seams. Forces tile_batch_size=1."}),
                             }}
     RETURN_TYPES = ("MODEL",)
     FUNCTION = "apply"
@@ -888,35 +926,47 @@ class TiledDiffusion():
     def __init__(self) -> None:
         self.__class__.instances.add(self)
 
-    def apply(self, model: ModelPatcher, method, tile_width, tile_height, tile_overlap, tile_batch_size):
+    def apply(self, model: ModelPatcher, method, tile_width, tile_height, tile_overlap, tile_batch_size, rope_patch="auto"):
         if method == "Mixture of Diffusers":
             self.impl = MixtureOfDiffusers()
         elif method == "MultiDiffusion":
             self.impl = MultiDiffusion()
         else:
             self.impl = SpotDiffusion()
-        
-        # if noise_inversion:
-        #     get_cache_callback = self.noise_inverse_get_cache
-        #     set_cache_callback = None # lambda x0, xt, prompts: self.noise_inverse_set_cache(p, x0, xt, prompts, steps, retouch)
-        #     self.impl.init_noise_inverse(steps, retouch, get_cache_callback, set_cache_callback, renoise_strength, renoise_kernel_size)
 
         compression = 4 if "CASCADE" in str(model.model.model_type) else 8
+
+        # Detect Flux-like model (has process_img + RoPE via EmbedND).
+        # When enabled, inject per-tile rope_options to preserve global RoPE coordinates,
+        # fixing seams caused by each tile restarting RoPE at (0,0).
+        diffusion_model = getattr(model.model, 'diffusion_model', None)
+        is_flux_like = diffusion_model is not None and hasattr(diffusion_model, 'process_img')
+
+        if rope_patch == "enable":
+            enable_rope = True
+        elif rope_patch == "disable":
+            enable_rope = False
+        else:  # auto
+            enable_rope = is_flux_like
+
+        self.impl.rope_per_tile = enable_rope
+        self.impl.patch_size = getattr(diffusion_model, 'patch_size', 2) if diffusion_model is not None else 2
+
+        # rope_per_tile requires one bbox per forward call so rope_options can differ per tile.
+        effective_batch_size = 1 if enable_rope else tile_batch_size
+        if enable_rope and tile_batch_size != 1:
+            print(f"[TiledDiffusion] Flux/DiT RoPE patch enabled: forcing tile_batch_size=1 (was {tile_batch_size}) for per-tile global RoPE coordinates.")
+
         self.impl.tile_width = tile_width // compression
         self.impl.tile_height = tile_height // compression
         self.impl.tile_overlap = tile_overlap // compression
-        self.impl.tile_batch_size = tile_batch_size
-        
+        self.impl.tile_batch_size = effective_batch_size
+
         self.impl.compression = compression
         self.impl.width = tile_width
         self.impl.height  = tile_height
         self.impl.overlap = tile_overlap
 
-        # self.impl.init_grid_bbox(tile_width, tile_height, tile_overlap, tile_batch_size)
-        # # init everything done, perform sanity check & pre-computations
-        # self.impl.init_done()
-        # hijack the behaviours
-        # self.impl.hook()
         model = model.clone()
         model.set_model_unet_function_wrapper(self.impl)
         model.model_options['tiled_diffusion'] = True
