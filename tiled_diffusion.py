@@ -151,6 +151,14 @@ class AbstractDiffusion:
         self.uniform_distribution = None
         self.sigmas = None
 
+        # Flux/DiT RoPE per-tile global position rewrite.
+        # When True, injects transformer_options["rope_options"] with shift_x/shift_y
+        # so each tile's RoPE uses absolute canvas coordinates instead of restarting
+        # at (0,0). Fixes seams on Flux / Flux.2 / Flux.2 Klein.
+        # Requires tile_batch_size=1 (one bbox per forward call).
+        self.rope_per_tile: bool = False
+        self.patch_size: int = 2
+
     def reset(self):
         tile_width = self.tile_width
         tile_height = self.tile_height
@@ -516,6 +524,18 @@ class MultiDiffusion(AbstractDiffusion):
                             v = torch.cat([v[bbox_.slicer] for bbox_ in bboxes_[batch_id]])
                         if v.shape[0] != x_tile.shape[0]:
                             v = repeat_to_batch_size(v, x_tile.shape[0])
+                    elif isinstance(v, list) and len(v) > 0 and all(isinstance(e, torch.Tensor) for e in v):
+                        # List-of-tensor conditioning (e.g. Flux/Flux.2 ref_latents).
+                        # For 4D refs spatially aligned with x_in: tile with same bboxes so
+                        # each tile only attends to its own reference region (I2I/edit speed).
+                        new_v = []
+                        for e in v:
+                            if len(e.shape) == len(x_tile.shape) and e.shape[-2:] == x_in.shape[-2:]:
+                                e = torch.cat([e[bbox.slicer] for bbox in bboxes], dim=0)
+                            if e.shape[0] != x_tile.shape[0]:
+                                e = repeat_to_batch_size(e, x_tile.shape[0])
+                            new_v.append(e)
+                        v = new_v
                     c_tile[k] = v
 
                 # controlnet tiling
@@ -670,6 +690,18 @@ class SpotDiffusion(AbstractDiffusion):
                             v = torch.cat([v[bbox_.slicer] for bbox_ in bboxes_[batch_id]])
                         if v.shape[0] != x_tile.shape[0]:
                             v = repeat_to_batch_size(v, x_tile.shape[0])
+                    elif isinstance(v, list) and len(v) > 0 and all(isinstance(e, torch.Tensor) for e in v):
+                        # List-of-tensor (Flux/Flux.2 ref_latents): tile spatially if aligned,
+                        # then roll to match SpotDiffusion shift.
+                        new_v = []
+                        for e in v:
+                            if len(e.shape) == len(x_tile.shape) and e.shape[-2:] == x_in.shape[-2:]:
+                                e = e.roll(shifts=(sh_h, sh_w), dims=(-2,-1))
+                                e = torch.cat([e[bbox.slicer] for bbox in bboxes], dim=0)
+                            if e.shape[0] != x_tile.shape[0]:
+                                e = repeat_to_batch_size(e, x_tile.shape[0])
+                            new_v.append(e)
+                        v = new_v
                     c_tile[k] = v
 
                 # controlnet tiling
@@ -790,8 +822,18 @@ class MixtureOfDiffusers(AbstractDiffusion):
                             v = torch.cat([v[bbox_.slicer] for bbox_ in bboxes_[batch_id]])
                         if v.shape[0] != x_tile.shape[0]:
                             v = repeat_to_batch_size(v, x_tile.shape[0])
+                    elif isinstance(v, list) and len(v) > 0 and all(isinstance(e, torch.Tensor) for e in v):
+                        # List-of-tensor (Flux/Flux.2 ref_latents): tile spatially if aligned.
+                        new_v = []
+                        for e in v:
+                            if len(e.shape) == len(x_tile.shape) and e.shape[-2:] == x_in.shape[-2:]:
+                                e = torch.cat([e[bbox.slicer] for bbox in bboxes], dim=0)
+                            if e.shape[0] != x_tile.shape[0]:
+                                e = repeat_to_batch_size(e, x_tile.shape[0])
+                            new_v.append(e)
+                        v = new_v
                     c_tile[k] = v
-                
+
                 # controlnet
                 # self.switch_controlnet_tensors(batch_id, N, len(bboxes), is_denoise=True)
                 if 'control' in c_in:
