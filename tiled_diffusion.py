@@ -20,6 +20,53 @@ def ceildiv(big, small):
     # Correct ceiling division that avoids floating-point errors and importing math.ceil.
     return -(big // -small)
 
+
+def _install_qwen_rope_monkeypatch(diffusion_model):
+    """
+    Wrap diffusion_model.process_img so that, when self._td_tile_state is set
+    (by TiledDiffusion right before a tile forward), the returned img_ids are
+    re-centered on the global canvas instead of the tile. The state attribute
+    is consumed (cleared) on the first call so subsequent ref_latents calls
+    inside the same forward use the original behaviour.
+    """
+    if getattr(diffusion_model, '_td_qwen_rope_installed', False):
+        return
+    original_process_img = diffusion_model.process_img
+
+    def patched_process_img(x, index=0, h_offset=0, w_offset=0):
+        state = getattr(diffusion_model, '_td_tile_state', None)
+        if state is None:
+            return original_process_img(x, index=index, h_offset=h_offset, w_offset=w_offset)
+        # one-shot
+        diffusion_model._td_tile_state = None
+
+        h_off_px = int(state['h_offset_pixels'])
+        w_off_px = int(state['w_offset_pixels'])
+        canvas_h_len = int(state['canvas_h_len'])
+        canvas_w_len = int(state['canvas_w_len'])
+
+        hidden_states, img_ids, orig_shape = original_process_img(
+            x, index=index, h_offset=h_off_px, w_offset=w_off_px
+        )
+
+        # Original centers on tile_h_len // 2; we want canvas_h_len // 2.
+        ps = max(1, int(getattr(diffusion_model, 'patch_size', 2)))
+        h_pix = x.shape[-2]
+        w_pix = x.shape[-1]
+        tile_h_len = (h_pix + (ps // 2)) // ps
+        tile_w_len = (w_pix + (ps // 2)) // ps
+        h_shift = (tile_h_len // 2) - (canvas_h_len // 2)
+        w_shift = (tile_w_len // 2) - (canvas_w_len // 2)
+        if h_shift != 0:
+            img_ids[..., 1] = img_ids[..., 1] + h_shift
+        if w_shift != 0:
+            img_ids[..., 2] = img_ids[..., 2] + w_shift
+        return hidden_states, img_ids, orig_shape
+
+    diffusion_model.process_img = patched_process_img
+    diffusion_model._td_qwen_rope_installed = True
+    diffusion_model._td_tile_state = None
+
 from enum import Enum
 class BlendMode(Enum):  # i.e. LayerType
     FOREGROUND = 'Foreground'
@@ -51,7 +98,7 @@ class BBox:
         self.w = w
         self.h = h
         self.box = [x, y, x+w, y+h]
-        self.slicer = slice(None), slice(None), slice(y, y+h), slice(x, x+w)
+        self.slicer = (..., slice(y, y+h), slice(x, x+w))
 
     def __getitem__(self, idx:int) -> int:
         return self.box[idx]
@@ -158,9 +205,17 @@ class AbstractDiffusion:
         # Requires tile_batch_size=1 (one bbox per forward call).
         self.rope_per_tile: bool = False
         self.patch_size: int = 2
+        # Per-tile RoPE flavour: "flux" uses transformer_options["rope_options"] (shift_x/shift_y
+        # in patch units, supports DyPE scale). "qwen" sets a per-call attribute on the
+        # diffusion_model that our monkey-patched process_img consumes (Qwen-Image's
+        # process_img does not honour transformer_options).
+        self.rope_flavour: str = "flux"
+        # Reference to the diffusion_model instance (set in apply()) so we can stash per-tile
+        # state for the Qwen process_img monkey-patch.
+        self.diffusion_model = None
         # Static DyPE-style RoPE scale (>1 stretches positional frequencies to help
         # pretrained models generate above training resolution). Applied only if
-        # an external DyPE node hasn't already set scale_x/scale_y.
+        # an external DyPE node hasn't already set scale_x/scale_y. (Flux only.)
         self.rope_scale: float = 1.0
 
     def reset(self):
@@ -218,20 +273,37 @@ class AbstractDiffusion:
     @grid_bbox
     def _inject_rope_options(self, c_tile: dict, bbox: 'BBox') -> None:
         """
-        For Flux/DiT tiled sampling: set transformer_options["rope_options"] so the
-        model's process_img() uses absolute canvas patch coordinates for this tile
-        instead of restarting RoPE at (0,0).
+        For DiT tiled sampling: tell the model where this tile sits on the global
+        canvas so RoPE doesn't restart at (0,0).
 
-        Composes with external RoPE scaling (e.g. DyPE): when scale_x/scale_y are
-        already set (by an upstream DyPE node or self.rope_scale), the per-tile
-        shift is multiplied by the scale so absolute patch positions match the
-        scaled global canvas. Shift is additive to any existing shift.
+        Two flavours:
+        - "flux": writes transformer_options["rope_options"] with shift_x/shift_y in
+          patch units (Flux/Flux.2). Composes with DyPE scale_x/scale_y.
+        - "qwen": writes transformer_options["tile_rope"] with h/w_offset in latent
+          pixels plus the global canvas dims (Qwen-Image-Edit), since Qwen's
+          process_img doesn't read rope_options.
         """
         if not self.rope_per_tile:
             return
         ps = max(1, int(self.patch_size))
         tf = c_tile.get('transformer_options', None)
         tf = dict(tf) if isinstance(tf, dict) else {}
+
+        if self.rope_flavour == "qwen":
+            # Stash per-tile state on the diffusion_model; our monkey-patched
+            # process_img consumes it (one-shot) on the next forward call.
+            if self.diffusion_model is not None:
+                canvas_h_len = max(1, (int(self.h) + (ps // 2)) // ps)
+                canvas_w_len = max(1, (int(self.w) + (ps // 2)) // ps)
+                self.diffusion_model._td_tile_state = {
+                    'h_offset_pixels': int(bbox.y),
+                    'w_offset_pixels': int(bbox.x),
+                    'canvas_h_len': canvas_h_len,
+                    'canvas_w_len': canvas_w_len,
+                }
+            return
+
+        # Flux flavour
         existing = tf.get('rope_options', None)
         rope_opts = dict(existing) if isinstance(existing, dict) else {}
 
@@ -521,7 +593,8 @@ class MultiDiffusion(AbstractDiffusion):
         c_in: dict = args["c"]
         cond_or_uncond: List = args["cond_or_uncond"]
 
-        N, C, H, W = x_in.shape
+        N = x_in.shape[0]
+        H, W = x_in.shape[-2:]
 
         # comfyui can feed in a latent that's a different size cause of SetArea, so we'll refresh in that case.
         self.refresh = False
@@ -595,7 +668,7 @@ class MultiDiffusion(AbstractDiffusion):
                 x_tile_out = model_function(x_tile, t_tile, **c_tile)
 
                 for i, bbox in enumerate(bboxes):
-                    self.x_buffer[bbox.slicer] += x_tile_out[i*N:(i+1)*N, :, :, :]
+                    self.x_buffer[bbox.slicer] += x_tile_out[i*N:(i+1)*N]
                 del x_tile_out, x_tile, t_tile, c_tile
 
                 # update progress bar
@@ -644,7 +717,8 @@ class SpotDiffusion(AbstractDiffusion):
         c_in: dict = args["c"]
         cond_or_uncond: List = args["cond_or_uncond"]
 
-        N, C, H, W = x_in.shape
+        N = x_in.shape[0]
+        H, W = x_in.shape[-2:]
 
         # comfyui can feed in a latent that's a different size cause of SetArea, so we'll refresh in that case.
         self.refresh = False
@@ -767,7 +841,7 @@ class SpotDiffusion(AbstractDiffusion):
                 x_tile_out = model_function(x_tile, t_tile, **c_tile)
 
                 for i, bbox in enumerate(bboxes):
-                    self.x_buffer[bbox.slicer] = x_tile_out[i*N:(i+1)*N, :, :, :]
+                    self.x_buffer[bbox.slicer] = x_tile_out[i*N:(i+1)*N]
 
                 del x_tile_out, x_tile, t_tile, c_tile
 
@@ -823,7 +897,8 @@ class MixtureOfDiffusers(AbstractDiffusion):
         c_in: dict = args["c"]
         cond_or_uncond: List= args["cond_or_uncond"]
 
-        N, C, H, W = x_in.shape
+        N = x_in.shape[0]
+        H, W = x_in.shape[-2:]
 
         self.refresh = False
         # self.refresh = True
@@ -906,7 +981,7 @@ class MixtureOfDiffusers(AbstractDiffusion):
                     # These weights can be calcluated in advance, but will cost a lot of vram 
                     # when you have many tiles. So we calculate it here.
                     w = self.tile_weights * self.rescale_factor[bbox.slicer]
-                    self.x_buffer[bbox.slicer] += x_tile_out[i*N:(i+1)*N, :, :, :] * w
+                    self.x_buffer[bbox.slicer] += x_tile_out[i*N:(i+1)*N] * w
                 del x_tile_out, x_tile, t_tile, c_tile
 
                 # self.update_pbar()
@@ -961,25 +1036,38 @@ class TiledDiffusion():
         # When enabled, inject per-tile rope_options to preserve global RoPE coordinates,
         # fixing seams caused by each tile restarting RoPE at (0,0).
         diffusion_model = getattr(model.model, 'diffusion_model', None)
-        is_flux_like = diffusion_model is not None and hasattr(diffusion_model, 'process_img')
+        dm_module = type(diffusion_model).__module__ if diffusion_model is not None else ""
+        # Flux: reads transformer_options["rope_options"] directly.
+        # Qwen-Image: needs our patched process_img() reading transformer_options["tile_rope"].
+        is_flux_like = dm_module.startswith("comfy.ldm.flux")
+        is_qwen_like = dm_module.startswith("comfy.ldm.qwen_image")
+        is_dit_supported = is_flux_like or is_qwen_like
+        rope_flavour = "qwen" if is_qwen_like else "flux"
 
         if rope_patch == "enable":
             enable_rope = True
         elif rope_patch == "disable":
             enable_rope = False
         else:  # auto
-            enable_rope = is_flux_like
+            enable_rope = is_dit_supported
 
         self.impl.rope_per_tile = enable_rope
+        self.impl.rope_flavour = rope_flavour
         self.impl.patch_size = getattr(diffusion_model, 'patch_size', 2) if diffusion_model is not None else 2
         self.impl.rope_scale = float(rope_scale)
+        self.impl.diffusion_model = diffusion_model
+
+        if enable_rope and rope_flavour == "qwen" and diffusion_model is not None:
+            _install_qwen_rope_monkeypatch(diffusion_model)
 
         # rope_per_tile requires one bbox per forward call so rope_options can differ per tile.
         effective_batch_size = 1 if enable_rope else tile_batch_size
         if enable_rope and tile_batch_size != 1:
-            print(f"[TiledDiffusion] Flux/DiT RoPE patch enabled: forcing tile_batch_size=1 (was {tile_batch_size}) for per-tile global RoPE coordinates.")
-        if enable_rope and float(rope_scale) != 1.0:
+            print(f"[TiledDiffusion] {rope_flavour.title()} DiT RoPE patch enabled: forcing tile_batch_size=1 (was {tile_batch_size}) for per-tile global RoPE coordinates.")
+        if enable_rope and rope_flavour == "flux" and float(rope_scale) != 1.0:
             print(f"[TiledDiffusion] RoPE scale = {rope_scale} (DyPE-style frequency stretch; set to 1.0 to disable).")
+        if enable_rope and rope_flavour == "qwen" and float(rope_scale) != 1.0:
+            print(f"[TiledDiffusion] rope_scale is ignored for Qwen-Image (Flux-only).")
 
         self.impl.tile_width = tile_width // compression
         self.impl.tile_height = tile_height // compression
