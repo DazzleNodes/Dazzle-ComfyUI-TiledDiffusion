@@ -21,6 +21,24 @@ def ceildiv(big, small):
     return -(big // -small)
 
 
+def _control_pixel_scale(control):
+    """
+    Return (h_pixels_per_latent_unit, w_pixels_per_latent_unit) for a ControlNet,
+    used to size the RGB hint upscale (PH, PW) before optional VAE-encode.
+    Video/Wan-family VAEs (Qwen-Image, Wan21, HunyuanVideo) expose downscale_ratio
+    as a (temporal_func, spatial_h, spatial_w) tuple; SD-family VAEs expose it as
+    an int. Slicing of the post-encode hint uses control.compression_ratio
+    directly (1 for VAE-aware ControlNets, 8 for SD-style RGB-input ControlNets).
+    """
+    cr = control.compression_ratio
+    if getattr(control, 'vae', None) is not None:
+        dsr = control.vae.downscale_ratio
+        if isinstance(dsr, (tuple, list)):
+            return cr * dsr[1], cr * dsr[2]
+        return cr * dsr, cr * dsr
+    return cr, cr
+
+
 def _install_qwen_rope_monkeypatch(diffusion_model):
     """
     Wrap diffusion_model.process_img so that, when self._td_tile_state is set
@@ -474,13 +492,10 @@ class AbstractDiffusion:
                 if control.cond_hint is not None:
                     del control.cond_hint
                 control.cond_hint = None
-                compression_ratio = control.compression_ratio
-                if getattr(control, 'vae', None) is not None:
-                    compression_ratio *= control.vae.downscale_ratio
-                else:
-                    if getattr(control, 'latent_format', None) is not None:
-                        raise ValueError("This Controlnet needs a VAE but none was provided, please use a ControlNetApply node with a VAE input and connect it.")
-                PH, PW = self.h * compression_ratio, self.w * compression_ratio
+                if getattr(control, 'vae', None) is None and getattr(control, 'latent_format', None) is not None:
+                    raise ValueError("This Controlnet needs a VAE but none was provided, please use a ControlNetApply node with a VAE input and connect it.")
+                ph_ratio, pw_ratio = _control_pixel_scale(control)
+                PH, PW = self.h * ph_ratio, self.w * pw_ratio
 
                 device = getattr(control, 'device', x_noisy.device)
                 dtype = getattr(control, 'manual_cast_dtype', None)
@@ -520,12 +535,16 @@ class AbstractDiffusion:
                 #
                 # Below can be in this if clause because self.refresh will trigger on resolution change,
                 # e.g. cause of ConditioningSetArea, so that particular case isn't cached atm.
+                #
+                # cf maps latent-space bbox coordinates into cns's own coordinate space:
+                #   - SD ControlNet (no VAE): cns is RGB at pixel resolution → cf = compression_ratio = 8
+                #   - Qwen/Flux ControlNet (with VAE): cns has just been VAE-encoded to latent → cf = 1
+                # control.compression_ratio is set correctly by ComfyUI for both cases.
                 cf = control.compression_ratio
                 if cns.shape[0] != batch_size:
                     cns = repeat_to_batch_size(cns, batch_size)
                 if shifts is not None:
                     control.cns = cns
-                    # cns = cns.roll(shifts=tuple(x * cf for x in shifts), dims=(-2,-1))
                     sh_h,sh_w=shifts
                     sh_h *= cf
                     sh_w *= cf
@@ -537,7 +556,9 @@ class AbstractDiffusion:
                                 cns = control.cns.roll(shifts=sh_h, dims=-2)
                             else:
                                 cns = control.cns.roll(shifts=sh_w, dims=-1)
-                cns_slices = [cns[:, :, bbox[1]*cf:bbox[3]*cf, bbox[0]*cf:bbox[2]*cf] for bbox in bboxes]
+                # Ellipsis slicer handles both 4D (B,C,H,W) and 5D (B,C,T,H,W) cns tensors;
+                # 5D is needed for video/Wan-family VAE-encoded hints (Qwen-Image, Wan21).
+                cns_slices = [cns[..., bbox[1]*cf:bbox[3]*cf, bbox[0]*cf:bbox[2]*cf] for bbox in bboxes]
                 control.cond_hint = torch.cat(cns_slices, dim=0).to(device=cns.device)
                 del cns_slices
                 del cns
@@ -545,7 +566,6 @@ class AbstractDiffusion:
             else:
                 if hasattr(control,'cns') and shifts is not None:
                     cf = control.compression_ratio
-                    # cns = control.cns.roll(shifts=tuple(x * cf for x in shifts), dims=(-2,-1))
                     cns = control.cns
                     sh_h,sh_w=shifts
                     sh_h *= cf
@@ -558,7 +578,7 @@ class AbstractDiffusion:
                                 cns = control.cns.roll(shifts=sh_h, dims=-2)
                             else:
                                 cns = control.cns.roll(shifts=sh_w, dims=-1)
-                    cns_slices = [cns[:, :, bbox[1]*cf:bbox[3]*cf, bbox[0]*cf:bbox[2]*cf] for bbox in bboxes]
+                    cns_slices = [cns[..., bbox[1]*cf:bbox[3]*cf, bbox[0]*cf:bbox[2]*cf] for bbox in bboxes]
                     control.cond_hint = torch.cat(cns_slices, dim=0).to(device=cns.device)
                     del cns_slices
                     del cns
