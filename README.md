@@ -21,7 +21,8 @@ This extension enables **large image drawing & upscaling with limited VRAM** via
     - [x] FLUX (with Flux-specific RoPE patch — see [DiT/Flux Enhancements](#ditflux-enhancements))
     - [x] FLUX.2 / FLUX.2 Klein (T2I + I2I with reference latent)
     - [x] Qwen-Image-Edit (with Qwen-specific RoPE monkey-patch — see [DiT/Flux Enhancements](#ditflux-enhancements))
-- [x] ControlNet support
+    - [x] Qwen-Image base (T2I — recommend ControlNet or Hi-Res Fix recipe for large canvases; see [Pure-T2I tile coherence on Qwen-Image](#pure-t2i-tile-coherence-on-qwen-image--caveats-and-hi-res-fix-recipe))
+- [x] ControlNet support (Wan-family VAE-aware: Qwen-FunControl, Wan-Control, HunyuanVideo CN — handles 5-D latent hints and tuple `downscale_ratio`)
 - [ ] ~~StableSR support~~
 - [ ] ~~Tiled Noise Inversion~~
 - [x] Tiled VAE
@@ -52,6 +53,7 @@ This extension enables **large image drawing & upscaling with limited VRAM** via
 | `tile_batch_size` | The number of tiles to process in a batch                    |
 | `rope_patch`      | *(optional, DiT)* `auto` \| `enable` \| `disable`. Global RoPE per-tile rewrite. `auto` turns on for supported DiT models (Flux, Qwen-Image-Edit) so each tile keeps its absolute canvas coordinates, fixing seams caused by RoPE restarting at (0,0) on every tile. Forces `tile_batch_size=1`. Default: `auto`. |
 | `rope_scale`      | *(optional, Flux only)* Static DyPE-style RoPE frequency scale. Set >1 when rendering above training resolution (e.g. `2.0` for 2×, `1.5` for 1.5×). Composes with an external DyPE node if present (won't override). Ignored for Qwen-Image-Edit. Default: `1.0` (off). |
+| `structure_latent`| *(optional, DiT)* `LATENT`. Structural-prior latent injected per-tile via the model's `ref_latents` conditioning channel. Wire a canvas-sized latent (low-res non-tiled pass → `ImageScale` to target dims → `VAE Encode`) to give each tile spatially-aligned guidance without needing a ControlNet. Composes with `rope_patch`, `rope_scale`, and any `ReferenceLatent` already on the conditioning chain. Most useful for non-CN T2I on RoPE DiT models (Qwen-Image, Flux). See [Pure-T2I tile coherence on Qwen-Image](#pure-t2i-tile-coherence-on-qwen-image--caveats-and-hi-res-fix-recipe) for the recipe. |
 
 ### How can I specify the tiles' arrangement?
 
@@ -89,6 +91,74 @@ This fork addresses all three with two RoPE flavours, auto-detected by model mod
 - Qwen-Image-Edit: use `rope_patch=auto` (auto-detected). The monkey-patch is installed once per model and composes with any upstream conditioning.
 - Rendering 2× training resolution (Flux only): set `rope_scale=2.0`. For other multipliers, use `rope_scale ≈ output_res / training_res`.
 - Stack with external speed optimisations (Nunchaku SVDQuant, EasyCache/MagCache, SageAttention) — all orthogonal and compose cleanly.
+
+### Pure-T2I tile coherence on Qwen-Image — caveats and Hi-Res Fix recipe
+
+The `rope_patch` in this fork fixes seams for Flux-family T2I and provides correct positional anchoring for Qwen-Image-Edit's reference latents. For **Qwen-Image base T2I with no ControlNet and no reference latent**, however, the patch is empirically a thin lever — tiles can still render independent renditions of the prompt's subject rather than a single coherent canvas.
+
+**Why** — RoPE encodes positions as element-wise rotations of Q/K, so attention depends only on the *relative* offset `(p - q)` within each window. Inside one tile, image-image self-attention sees the same relative offsets regardless of where the tile lives on the global canvas. Shifting all `img_ids` by a constant therefore has no direct effect on image self-attention; it only changes text↔image cross-attention distances. For Flux that secondary lever is apparently enough to coordinate tiles; for Qwen-Image it empirically is not.
+
+**What anchors tiles, in order of strength:**
+
+| Setup | Anchor | Notes |
+|---|---|---|
+| Qwen-Image + ControlNet (canny / depth / Qwen-FunControl) + tiled | Per-tile-sliced CN residuals injected at every block | Strongest. Single-pass. |
+| Qwen-Image-Edit + reference latent + tiled | Ref tokens with global positions via cross-attention | Strong. |
+| Qwen-Image base T2I + Hi-Res Fix recipe (below) | Structural prior from low-res pre-pass | Good. Two-pass. |
+| Qwen-Image base T2I, single tiled pass above training res, no CN/ref | Only rope-patch (thin) | **Tiles will likely be disjoint.** |
+
+**Two ways to apply a structural prior** (Path 2 is the recommended path; Path 1 is experimental):
+
+**Path 2 — Hi-Res Fix recipe** (recommended; two-pass, partial denoise). Works today, no node changes, no extra slowdown, produces coherent output on Qwen-Image base. **Use this.**
+
+1. **Low-res pass** — sample at ~1024² (Qwen training resolution) with an ordinary non-tiled `KSampler` to lock global structure: subject placement, lighting, composition. Use the prompt and seed intended for the final high-res output.
+2. **Upscale** — VAE-decode → `ImageScale` (or your preferred upscaler) to target dimensions → VAE-encode back to a high-res latent.
+3. **Tiled refine** — feed the high-res latent (NOT a fresh empty latent) into `KSampler` with the `TiledDiffusion`-patched model and `denoise` between `0.4` and `0.65`. The tiles refine an already-coherent canvas instead of rendering the prompt from scratch.
+
+Tips for Path 2:
+- **`denoise` is the lever** — too high (≥0.8) and tiles forget the structural prior; too low (≤0.3) and tiles barely add detail. `0.5` is a good starting point for 2× upscales.
+- Match the AR of the low-res pass to the final target so `ImageScale` is a clean uniform scale (e.g. for 1611×2416 final, use ~836×1254 low-res).
+- Keep `tile_overlap ≥ tile_width / 3` for clean blending.
+- Leave `rope_patch=auto`. It composes with both paths.
+- Composes with ControlNet — combine for the largest, most ambitious renders.
+
+If you have any ControlNet at all (canny, depth, Qwen-FunControl, etc.), prefer the single-pass tiled flow with the ControlNet hint at full canvas size — this fork now slices Wan-family-VAE-aware ControlNet hints correctly per tile (5-D ellipsis slicing, tuple `downscale_ratio` arithmetic), and CN residuals are the strongest coherence anchor available, with no token-doubling overhead.
+
+> [!WARNING]
+> **Path 1 below is experimental and known to produce garbled output on Qwen-Image base.** It works through Qwen's `ref_latents` conditioning channel, which Qwen-Image-Edit was trained for but base Qwen-Image was not. On base Qwen-Image, ref tokens at temporal index=1 are noise the model can't interpret — empirically this produces NaN-adjacent values through attention, surfacing as magenta speckle and brick-pattern artefacts after VAE decode (see `tests/checklists/v0.x__Phase__R2-...md` for the empirical run). It also doubles the attention sequence length, making sampling ~2× slower. Use Path 2 above unless you specifically know your model is Qwen-Image-Edit (or Flux Kontext / Flux.2 Klein, which have similar training).
+
+**Path 1 — `structure_latent` input** (experimental; single-pass, full denoise). Wire a canvas-sized structural latent into the new `structure_latent` input on the `TiledDiffusion` node. Each tile receives the spatially-aligned slice as a `ref_latents` token. Architecturally clean for ref-trained models; broken on Qwen-Image base.
+
+```mermaid
+flowchart LR
+    subgraph PrePass["Low-res pre-pass (run once)"]
+        direction TB
+        EL1[Empty Latent<br/>1024²]
+        KS1[KSampler<br/>denoise=1.0]
+        VD1[VAE Decode]
+        IS[ImageScale<br/>to target dims]
+        VE[VAE Encode]
+        EL1 --> KS1 --> VD1 --> IS --> VE
+    end
+
+    subgraph HiRes["High-res tiled pass"]
+        direction TB
+        M[MODEL]
+        TD["TiledDiffusion node<br/>method, tile_*, rope_patch"]
+        EL2[Empty Latent<br/>target dims]
+        KS2[KSampler<br/>denoise=1.0]
+        VD2[VAE Decode]
+        SI[Save Image]
+        M --> TD
+        TD -->|patched MODEL| KS2
+        EL2 -->|latent_image| KS2
+        KS2 --> VD2 --> SI
+    end
+
+    VE ==>|structure_latent| TD
+```
+
+In words: a one-time low-res pre-pass produces a structural latent at the *target* resolution (low-res sample → decode → upscale image → re-encode). That latent is wired into the `TiledDiffusion` node's `structure_latent` input. The patched MODEL then drives a normal high-res `KSampler` over a fresh empty latent at the target size — the per-tile structure injection happens inside `TiledDiffusion`'s tile loop, transparent to `KSampler`. **As of 2026-04-28, this path is broken on Qwen-Image base** (see warning above and R2 checklist for the empirical artefact). Kept in the codebase because the architecture is still sound for ref-trained models (Qwen-Image-Edit, Flux Kontext, Flux.2 Klein); R3 noise-structuring (`tests/checklists/v0.x__Phase__R2-...md` decision matrix → Phase R4) is the planned follow-up for a model-agnostic fix.
 
 ### SpotDiffusion
 

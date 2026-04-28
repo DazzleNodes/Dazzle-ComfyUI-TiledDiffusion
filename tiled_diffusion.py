@@ -236,6 +236,11 @@ class AbstractDiffusion:
         # an external DyPE node hasn't already set scale_x/scale_y. (Flux only.)
         self.rope_scale: float = 1.0
 
+        # Optional structural prior (LATENT) connected via the TiledDiffusion node's
+        # structure_latent input. When set, sliced per-tile and appended to
+        # c_tile['ref_latents']. Off by default. See _inject_structure_latent.
+        self.structure_latent: Tensor = None
+
     def reset(self):
         tile_width = self.tile_width
         tile_height = self.tile_height
@@ -342,6 +347,48 @@ class AbstractDiffusion:
         rope_opts['shift_x'] = float(bbox.x) / ps * scale_x + rope_opts.get('shift_x', 0.0)
         tf['rope_options'] = rope_opts
         c_tile['transformer_options'] = tf
+
+    def _inject_structure_latent(self, c_tile: dict, x_tile: 'Tensor', x_in: 'Tensor', bboxes: 'List[BBox]') -> None:
+        """
+        For non-CN T2I tile coherence: inject a structural-prior latent through
+        the existing ref_latents conditioning channel. The user supplies a
+        canvas-sized LATENT (typically a low-res non-tiled pass + image upscale
+        + VAE-encode at target dimensions) via the TiledDiffusion node's
+        structure_latent input. Each tile then receives the spatially-aligned
+        slice of that latent as a reference token, so the model's attention
+        sees per-tile-varying structural signal even without a ControlNet.
+
+        Mirrors the c_in list-of-tensor loop:
+        - If structure_latent's spatial dims match x_in's, slice per bbox
+          (per-tile spatial guidance).
+        - Otherwise, broadcast (each tile sees the full smaller reference).
+        - Then batch-repeat to match the tile batch.
+
+        Appends to any pre-existing c_tile['ref_latents'] rather than replacing,
+        so this composes with an explicit ReferenceLatent node already in the
+        user's conditioning chain (Flux Kontext, Flux.2 Klein, Qwen-Image-Edit).
+        """
+        sl = getattr(self, 'structure_latent', None)
+        if sl is None:
+            return
+
+        if len(sl.shape) == len(x_tile.shape) and sl.shape[-2:] == x_in.shape[-2:]:
+            sl_tile = torch.cat([sl[bbox.slicer] for bbox in bboxes], dim=0)
+        else:
+            sl_tile = sl
+
+        if sl_tile.shape[0] != x_tile.shape[0]:
+            sl_tile = repeat_to_batch_size(sl_tile, x_tile.shape[0])
+
+        existing = c_tile.get('ref_latents')
+        if existing is None:
+            c_tile['ref_latents'] = [sl_tile]
+        elif isinstance(existing, list):
+            c_tile['ref_latents'] = list(existing) + [sl_tile]
+        else:
+            # Defensive: most ComfyUI paths produce a list-of-tensors here. If
+            # something else has put a non-list value under the key, wrap it.
+            c_tile['ref_latents'] = [existing, sl_tile]
 
     def init_grid_bbox(self, tile_w:int, tile_h:int, overlap:int, tile_bs:int):
         # if self._init_grid_bbox is not None: return
@@ -685,6 +732,9 @@ class MultiDiffusion(AbstractDiffusion):
                 if self.rope_per_tile and len(bboxes) == 1:
                     self._inject_rope_options(c_tile, bboxes[0])
 
+                # Optional per-tile structure_latent injection (non-CN coherence anchor).
+                self._inject_structure_latent(c_tile, x_tile, x_in, bboxes)
+
                 x_tile_out = model_function(x_tile, t_tile, **c_tile)
 
                 for i, bbox in enumerate(bboxes):
@@ -858,6 +908,9 @@ class SpotDiffusion(AbstractDiffusion):
                 if self.rope_per_tile and len(bboxes) == 1:
                     self._inject_rope_options(c_tile, bboxes[0])
 
+                # Optional per-tile structure_latent injection (non-CN coherence anchor).
+                self._inject_structure_latent(c_tile, x_tile, x_in, bboxes)
+
                 x_tile_out = model_function(x_tile, t_tile, **c_tile)
 
                 for i, bbox in enumerate(bboxes):
@@ -993,6 +1046,9 @@ class MixtureOfDiffusers(AbstractDiffusion):
                 if self.rope_per_tile and len(bboxes) == 1:
                     self._inject_rope_options(c_tile, bboxes[0])
 
+                # Optional per-tile structure_latent injection (non-CN coherence anchor).
+                self._inject_structure_latent(c_tile, x_tile, x_in, bboxes)
+
                 # denoising: here the x is the noise
                 x_tile_out = model_function(x_tile, t_tile, **c_tile)
 
@@ -1027,6 +1083,7 @@ class TiledDiffusion():
                 "optional": {
                                 "rope_patch": (["auto", "enable", "disable"], {"default": "auto", "tooltip": "Flux/DiT global RoPE per-tile rewrite. 'auto' enables for Flux models to fix seams. Forces tile_batch_size=1."}),
                                 "rope_scale": ("FLOAT", {"default": 1.0, "min": 0.25, "max": 4.0, "step": 0.05, "tooltip": "DyPE-style RoPE frequency scale. Set >1 when rendering above training resolution (e.g. 2.0 for 2x training res on Flux). 1.0 = off. Composes with per-tile shift. Ignored if an external DyPE node already sets scale_x/scale_y."}),
+                                "structure_latent": ("LATENT", {"tooltip": "Optional structural prior for non-CN T2I tile coherence. Wire a LATENT (typically: low-res non-tiled KSampler -> VAE Decode -> ImageScale to target dims -> VAE Encode) to provide per-tile spatial guidance via the model's ref_latents conditioning channel. Tiles each see the spatially-aligned slice of this latent. Composes with rope_patch and ControlNet. Best on RoPE DiT models (Qwen-Image, Flux). See README 'Pure-T2I tile coherence on Qwen-Image'."}),
                             }}
     RETURN_TYPES = ("MODEL",)
     FUNCTION = "apply"
@@ -1042,7 +1099,7 @@ class TiledDiffusion():
     def __init__(self) -> None:
         self.__class__.instances.add(self)
 
-    def apply(self, model: ModelPatcher, method, tile_width, tile_height, tile_overlap, tile_batch_size, rope_patch="auto", rope_scale=1.0):
+    def apply(self, model: ModelPatcher, method, tile_width, tile_height, tile_overlap, tile_batch_size, rope_patch="auto", rope_scale=1.0, structure_latent=None):
         if method == "Mixture of Diffusers":
             self.impl = MixtureOfDiffusers()
         elif method == "MultiDiffusion":
@@ -1088,6 +1145,38 @@ class TiledDiffusion():
             print(f"[TiledDiffusion] RoPE scale = {rope_scale} (DyPE-style frequency stretch; set to 1.0 to disable).")
         if enable_rope and rope_flavour == "qwen" and float(rope_scale) != 1.0:
             print(f"[TiledDiffusion] rope_scale is ignored for Qwen-Image (Flux-only).")
+
+        # Optional structure_latent: apply latent-format normalization (matching what
+        # ComfyUI's ReferenceLatent path does in model_base.extra_conds) and store on
+        # the impl. Per-tile slicing happens at __call__ time via _inject_structure_latent.
+        #
+        # EXPERIMENTAL — this routes the structure latent through the model's
+        # ref_latents conditioning channel. Empirically (R2 checklist, 2026-04-28):
+        #   - Qwen-Image base produces garbled output (NaN-adjacent values through
+        #     attention -> magenta speckle, brick artefacts after VAE decode). Base
+        #     Qwen was not trained with ref_latents, so index=1 tokens are noise to it.
+        #   - Qwen-Image-Edit: untested by us, but architecturally consistent with
+        #     how Edit was trained; expected to work.
+        #   - Cost: ref tokens roughly double the attention sequence length, so the
+        #     forward is ~2x slower than non-ref tiled (and slower than ControlNet,
+        #     which adds residuals not tokens).
+        # For Qwen base T2I tile coherence, use the Hi-Res Fix recipe (Path 2 in README)
+        # — sample at training resolution, upscale, VAE-roundtrip, then tiled refine
+        # at denoise<1.0 starting from that latent. Works today, no slowdown, no garbage.
+        if structure_latent is not None:
+            sl_tensor = structure_latent['samples']
+            try:
+                sl_tensor = model.model.process_latent_in(sl_tensor)
+            except Exception as e:
+                print(f"[TiledDiffusion] structure_latent: process_latent_in unavailable ({e}); using raw latent.")
+            self.impl.structure_latent = sl_tensor
+            print(f"[TiledDiffusion] structure_latent EXPERIMENTAL: shape={tuple(sl_tensor.shape)} "
+                  f"connected. Will be sliced per-tile and appended to ref_latents. "
+                  f"NOTE: produces garbled output on Qwen-Image base; intended for Qwen-Image-Edit. "
+                  f"For base Qwen-Image T2I tile coherence, use the Hi-Res Fix recipe (denoise<1.0 "
+                  f"on an upscaled low-res latent) instead. See README 'Pure-T2I tile coherence on Qwen-Image'.")
+        else:
+            self.impl.structure_latent = None
 
         self.impl.tile_width = tile_width // compression
         self.impl.tile_height = tile_height // compression
