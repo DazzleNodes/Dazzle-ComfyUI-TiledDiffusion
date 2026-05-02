@@ -390,6 +390,18 @@ class AbstractDiffusion:
             # something else has put a non-list value under the key, wrap it.
             c_tile['ref_latents'] = [existing, sl_tile]
 
+        # Force ref_latents_method to "index_timestep_zero" so ref tokens are
+        # processed at timestep=0 (the model treats them as clean denoised content
+        # rather than additional noisy tokens at index=1). On Qwen-Image-Edit this
+        # is the documented "edit with clean reference" mode. On base Qwen-Image
+        # this changes the failure-mode characteristics versus default "index" --
+        # not guaranteed to fix coherence, but cheap to try and the most plausible
+        # tolerable framing for an untrained-on-refs model.
+        # Only override if the user hasn't set their own method via a stock
+        # ReferenceLatentSetSizeMethod node upstream.
+        if 'ref_latents_method' not in c_tile:
+            c_tile['ref_latents_method'] = "index_timestep_zero"
+
     def init_grid_bbox(self, tile_w:int, tile_h:int, overlap:int, tile_bs:int):
         # if self._init_grid_bbox is not None: return
         # self._init_grid_bbox = True
