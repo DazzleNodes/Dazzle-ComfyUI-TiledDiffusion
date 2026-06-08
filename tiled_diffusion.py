@@ -1,3 +1,5 @@
+import os
+import time
 import torch
 from torch import Tensor
 from typing import List, Union, Tuple, Callable, Dict
@@ -12,6 +14,12 @@ from comfy.controlnet import ControlNet, T2IAdapter
 from comfy.utils import common_upscale
 from comfy.model_management import processing_interrupted, loaded_models, load_models_gpu
 from math import pi
+
+# S1 profiler: enable via env var TILED_DIFFUSION_PROFILE=1 (or any truthy value).
+# When on, MixtureOfDiffusers.__call__ logs per-section wall-clock timings each
+# step plus running totals every 10 calls. Off by default; zero overhead when
+# the flag is unset because every measurement is gated.
+_TD_PROFILE = os.environ.get('TILED_DIFFUSION_PROFILE', '').lower() not in ('', '0', 'false', 'no', 'off')
 
 opt_C = 4
 opt_f = 8
@@ -240,6 +248,31 @@ class AbstractDiffusion:
         # structure_latent input. When set, sliced per-tile and appended to
         # c_tile['ref_latents']. Off by default. See _inject_structure_latent.
         self.structure_latent: Tensor = None
+
+        # S1 profiler state (only populated when _TD_PROFILE is True).
+        self._prof_calls: int = 0
+        self._prof_totals: Dict[str, float] = {}
+
+    def _prof_log(self, sections: Dict[str, float], n_batches: int, n_tiles_per_batch: int) -> None:
+        """Log one profile entry per __call__ (one diffusion timestep).
+
+        sections: {label: seconds_summed_across_inner_loop}
+        n_batches: outer-loop iteration count (tile-batches in this step)
+        n_tiles_per_batch: max bboxes seen in any inner iteration
+        """
+        if not _TD_PROFILE:
+            return
+        self._prof_calls += 1
+        total = sum(sections.values())
+        for k, v in sections.items():
+            self._prof_totals[k] = self._prof_totals.get(k, 0.0) + v
+        per_section = ' '.join(f'{k}={v*1000:7.2f}ms' for k, v in sections.items())
+        print(f'[TD-prof #{self._prof_calls:03d} nb={n_batches} nt/b={n_tiles_per_batch}] '
+              f'{per_section}  TOT={total*1000:7.2f}ms')
+        if self._prof_calls % 10 == 0:
+            cum = ' '.join(f'{k}={v:6.2f}s' for k, v in self._prof_totals.items())
+            cum_total = sum(self._prof_totals.values())
+            print(f'[TD-prof CUM after {self._prof_calls} calls TOT={cum_total:.2f}s] {cum}')
 
     def reset(self):
         tile_width = self.tile_width
@@ -977,6 +1010,11 @@ class MixtureOfDiffusers(AbstractDiffusion):
 
     @torch.inference_mode()
     def __call__(self, model_function: BaseModel.apply_model, args: dict):
+        if _TD_PROFILE:
+            prof = {'setup': 0.0, 'x_tile': 0.0, 'c_tile': 0.0, 'cnet': 0.0,
+                    'rope': 0.0, 'slat': 0.0, 'model': 0.0, 'debat': 0.0}
+            _t_setup = time.perf_counter()
+
         x_in: Tensor = args["input"]
         t_in: Tensor = args["timestep"]
         c_in: dict = args["c"]
@@ -997,22 +1035,32 @@ class MixtureOfDiffusers(AbstractDiffusion):
         # clear buffer canvas
         self.reset_buffer(x_in)
 
-        # self.pbar = tqdm(total=(self.total_bboxes) * sampling_steps, desc=f"{self.method} Sampling: ")
-        # self.pbar = tqdm(total=len(self.batched_bboxes), desc=f"{self.method} Sampling: ")
+        if _TD_PROFILE:
+            prof['setup'] = time.perf_counter() - _t_setup
+
+        n_batches = 0
+        n_tiles_per_batch = 0
 
         # Global sampling
         if self.draw_background:
             for batch_id, bboxes in enumerate(self.batched_bboxes):     # batch_id is the `Latent tile batch size`
-                if processing_interrupted(): 
-                    # self.pbar.close()
+                if processing_interrupted():
                     return x_in
+                n_batches += 1
+                if len(bboxes) > n_tiles_per_batch:
+                    n_tiles_per_batch = len(bboxes)
+
                 # batching
+                if _TD_PROFILE: _t = time.perf_counter()
                 x_tile_list     = []
                 for bbox in bboxes:
                     x_tile_list.append(x_in[bbox.slicer])
 
                 x_tile = torch.cat(x_tile_list, dim=0)                     # differs each
                 t_tile = repeat_to_batch_size(t_in, x_tile.shape[0])   # just repeat
+                if _TD_PROFILE: prof['x_tile'] += time.perf_counter() - _t
+
+                if _TD_PROFILE: _t = time.perf_counter()
                 c_tile = {}
                 for k, v in c_in.items():
                     if isinstance(v, torch.Tensor):
@@ -1044,38 +1092,52 @@ class MixtureOfDiffusers(AbstractDiffusion):
                             new_v.append(e)
                         v = new_v
                     c_tile[k] = v
+                if _TD_PROFILE: prof['c_tile'] += time.perf_counter() - _t
 
                 # controlnet
-                # self.switch_controlnet_tensors(batch_id, N, len(bboxes), is_denoise=True)
+                if _TD_PROFILE: _t = time.perf_counter()
                 if 'control' in c_in:
                     self.process_controlnet(x_tile, c_in, cond_or_uncond, bboxes, N, batch_id)
                     c_tile['control'] = c_in['control'].get_control_orig(x_tile, t_tile, c_tile, len(cond_or_uncond), c_in['transformer_options'])
-
-                # stablesr
-                # self.switch_stablesr_tensors(batch_id)
+                if _TD_PROFILE: prof['cnet'] += time.perf_counter() - _t
 
                 # Flux/DiT global RoPE per-tile (requires tile_batch_size=1).
+                if _TD_PROFILE: _t = time.perf_counter()
                 if self.rope_per_tile and len(bboxes) == 1:
                     self._inject_rope_options(c_tile, bboxes[0])
+                if _TD_PROFILE: prof['rope'] += time.perf_counter() - _t
 
                 # Optional per-tile structure_latent injection (non-CN coherence anchor).
+                if _TD_PROFILE: _t = time.perf_counter()
                 self._inject_structure_latent(c_tile, x_tile, x_in, bboxes)
+                if _TD_PROFILE: prof['slat'] += time.perf_counter() - _t
 
                 # denoising: here the x is the noise
+                # Sync before/after to attribute GPU work accurately to 'model'
+                # (without sync, kernel-launch returns immediately and GPU time
+                # leaks into the next CPU-side section).
+                if _TD_PROFILE:
+                    if x_tile.is_cuda: torch.cuda.synchronize()
+                    _t = time.perf_counter()
                 x_tile_out = model_function(x_tile, t_tile, **c_tile)
+                if _TD_PROFILE:
+                    if x_tile.is_cuda: torch.cuda.synchronize()
+                    prof['model'] += time.perf_counter() - _t
 
                 # de-batching
+                if _TD_PROFILE: _t = time.perf_counter()
                 for i, bbox in enumerate(bboxes):
-                    # These weights can be calcluated in advance, but will cost a lot of vram 
+                    # These weights can be calcluated in advance, but will cost a lot of vram
                     # when you have many tiles. So we calculate it here.
                     w = self.tile_weights * self.rescale_factor[bbox.slicer]
                     self.x_buffer[bbox.slicer] += x_tile_out[i*N:(i+1)*N] * w
                 del x_tile_out, x_tile, t_tile, c_tile
+                if _TD_PROFILE: prof['debat'] += time.perf_counter() - _t
 
-                # self.update_pbar()
-                # self.pbar.update()
-        # self.pbar.close()
         x_out = self.x_buffer
+
+        if _TD_PROFILE:
+            self._prof_log(prof, n_batches, n_tiles_per_batch)
 
         return x_out
 
