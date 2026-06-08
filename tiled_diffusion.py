@@ -249,6 +249,11 @@ class AbstractDiffusion:
         # c_tile['ref_latents']. Off by default. See _inject_structure_latent.
         self.structure_latent: Tensor = None
 
+        # Tracks (ref_hw, canvas_hw) pairs we've already warned about for the
+        # non-canvas reference-latent resample path, so the console gets one
+        # message per distinct mismatch instead of one per tile per step.
+        self._ref_resample_warned: set = set()
+
         # S1 profiler state (only populated when _TD_PROFILE is True).
         self._prof_calls: int = 0
         self._prof_totals: Dict[str, float] = {}
@@ -381,6 +386,73 @@ class AbstractDiffusion:
         tf['rope_options'] = rope_opts
         c_tile['transformer_options'] = tf
 
+    def _resample_ref_to_canvas(self, e: 'Tensor', x_in: 'Tensor') -> 'Tensor':
+        """Make a reference latent canvas-resolution so per-tile slicing aligns.
+
+        Reference latents (Flux/Flux.2 ref_latents, or the structure_latent input)
+        are positioned by RoPE that SHARES the image's spatial coordinates. In
+        comfy/ldm/flux/model.py:process_img the coordinate span of a token grid is
+        linspace(offset, patch_count-1+offset) -- i.e. it is set by the patch
+        count. So a reference whose resolution differs from the canvas has a
+        different patch count and therefore a different coordinate span: slicing
+        it per-tile would align it to only a sub-region of each tile, and handing
+        the whole thing to every tile (the previous behaviour) aligns it to the
+        top-left fraction and inflates memory. Empirically (see
+        tests/one-offs/reflatent_tiling_geometry.py) a 1MP ref on a 9MP canvas
+        covered 0.33 (sliced) / 0.73 (broadcast) of each tile; resampling to
+        canvas resolution gives 1.00 by construction.
+
+        So when a ref's spatial dims differ from the canvas we resample it to the
+        canvas resolution once, after which the existing exact-match slicing in
+        each __call__ (and in _inject_structure_latent) does the right thing.
+
+        Guard: only resample when the aspect ratio matches the canvas (within a
+        small tolerance). A genuine edit/Kontext reference is a *different* image,
+        often a different aspect, and must NOT be stretched to the canvas -- in
+        that case we leave it untouched (the caller then broadcasts it, the
+        edit-model behaviour) and warn once.
+
+        This is a correctness fix, not a memory optimisation: a correctly tiled
+        reference costs ~2x the tile's own token count regardless (the ref slice
+        equals the image tile size), the same as any canvas-resolution reference.
+        Returns e unchanged on the fast path (already canvas-res, or dims/ndim
+        mismatch, or aspect mismatch).
+        """
+        # Only handle tensors whose rank matches the latent and whose spatial
+        # dims differ from the canvas. Everything else is a no-op fast path.
+        if not isinstance(e, torch.Tensor) or len(e.shape) != len(x_in.shape):
+            return e
+        if e.shape[-2:] == x_in.shape[-2:]:
+            return e
+
+        ref_h, ref_w = int(e.shape[-2]), int(e.shape[-1])
+        can_h, can_w = int(x_in.shape[-2]), int(x_in.shape[-1])
+        key = ((ref_h, ref_w), (can_h, can_w))
+
+        # Aspect guard: stretching a different-aspect ref to the canvas would
+        # distort an edit/Kontext reference. Tolerance ~2%.
+        ref_aspect = ref_w / max(1, ref_h)
+        can_aspect = can_w / max(1, can_h)
+        if abs(ref_aspect - can_aspect) / can_aspect > 0.02:
+            if key not in self._ref_resample_warned:
+                self._ref_resample_warned.add(key)
+                print(f"[TiledDiffusion] Reference latent {ref_h}x{ref_w} aspect differs "
+                      f"from canvas {can_h}x{can_w}; treating it as a non-spatial "
+                      f"(edit/Kontext) reference -- broadcast to every tile, not spatially "
+                      f"tiled. If it was meant as a structural guide, match the canvas aspect ratio.")
+            return e
+
+        if key not in self._ref_resample_warned:
+            self._ref_resample_warned.add(key)
+            print(f"[TiledDiffusion] Reference latent {ref_h}x{ref_w} != canvas {can_h}x{can_w}; "
+                  f"resampling to canvas resolution so per-tile slices stay spatially aligned. "
+                  f"For best quality supply a canvas-resolution reference "
+                  f"(decode -> image upscale -> re-encode at target dims).")
+
+        # common_upscale takes (samples, width, height, method, crop) and handles
+        # both 4D and 5D latents (it folds any extra leading dims). Spatial-only.
+        return common_upscale(e, can_w, can_h, "bilinear", "disabled")
+
     def _inject_structure_latent(self, c_tile: dict, x_tile: 'Tensor', x_in: 'Tensor', bboxes: 'List[BBox]') -> None:
         """
         For non-CN T2I tile coherence: inject a structural-prior latent through
@@ -404,6 +476,11 @@ class AbstractDiffusion:
         sl = getattr(self, 'structure_latent', None)
         if sl is None:
             return
+
+        # Non-canvas structure latent -> resample to canvas resolution so the
+        # per-tile slice below stays spatially aligned (Solution C). No-op when
+        # already canvas-sized or aspect-mismatched (see _resample_ref_to_canvas).
+        sl = self._resample_ref_to_canvas(sl, x_in)
 
         if len(sl.shape) == len(x_tile.shape) and sl.shape[-2:] == x_in.shape[-2:]:
             sl_tile = torch.cat([sl[bbox.slicer] for bbox in bboxes], dim=0)
@@ -754,8 +831,11 @@ class MultiDiffusion(AbstractDiffusion):
                         # List-of-tensor conditioning (e.g. Flux/Flux.2 ref_latents).
                         # For 4D refs spatially aligned with x_in: tile with same bboxes so
                         # each tile only attends to its own reference region (I2I/edit speed).
+                        # A non-canvas-resolution ref is first resampled to canvas res so the
+                        # slice below stays spatially aligned (Solution C; no-op if matched).
                         new_v = []
                         for e in v:
+                            e = self._resample_ref_to_canvas(e, x_in)
                             if len(e.shape) == len(x_tile.shape) and e.shape[-2:] == x_in.shape[-2:]:
                                 e = torch.cat([e[bbox.slicer] for bbox in bboxes], dim=0)
                             if e.shape[0] != x_tile.shape[0]:
@@ -926,9 +1006,11 @@ class SpotDiffusion(AbstractDiffusion):
                             v = repeat_to_batch_size(v, x_tile.shape[0])
                     elif isinstance(v, list) and len(v) > 0 and all(isinstance(e, torch.Tensor) for e in v):
                         # List-of-tensor (Flux/Flux.2 ref_latents): tile spatially if aligned,
-                        # then roll to match SpotDiffusion shift.
+                        # then roll to match SpotDiffusion shift. A non-canvas-resolution ref
+                        # is first resampled to canvas res (Solution C; no-op if matched).
                         new_v = []
                         for e in v:
+                            e = self._resample_ref_to_canvas(e, x_in)
                             if len(e.shape) == len(x_tile.shape) and e.shape[-2:] == x_in.shape[-2:]:
                                 e = e.roll(shifts=(sh_h, sh_w), dims=(-2,-1))
                                 e = torch.cat([e[bbox.slicer] for bbox in bboxes], dim=0)
@@ -1083,8 +1165,11 @@ class MixtureOfDiffusers(AbstractDiffusion):
                             v = repeat_to_batch_size(v, x_tile.shape[0])
                     elif isinstance(v, list) and len(v) > 0 and all(isinstance(e, torch.Tensor) for e in v):
                         # List-of-tensor (Flux/Flux.2 ref_latents): tile spatially if aligned.
+                        # A non-canvas-resolution ref is first resampled to canvas res so the
+                        # slice below stays spatially aligned (Solution C; no-op if matched).
                         new_v = []
                         for e in v:
+                            e = self._resample_ref_to_canvas(e, x_in)
                             if len(e.shape) == len(x_tile.shape) and e.shape[-2:] == x_in.shape[-2:]:
                                 e = torch.cat([e[bbox.slicer] for bbox in bboxes], dim=0)
                             if e.shape[0] != x_tile.shape[0]:

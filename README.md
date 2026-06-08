@@ -92,6 +92,18 @@ This fork addresses all three with two RoPE flavours, auto-detected by model mod
 - Rendering 2× training resolution (Flux only): set `rope_scale=2.0`. For other multipliers, use `rope_scale ≈ output_res / training_res`.
 - Stack with external speed optimisations (Nunchaku SVDQuant, EasyCache/MagCache, SageAttention) — all orthogonal and compose cleanly.
 
+### Reference latents and tiling — resolution matters
+
+Reference latents (a stock `ReferenceLatent` node, or this node's `structure_latent` input) guide each tile by **sharing the image's spatial RoPE coordinates** — a tile's reference must line up with *that tile's* region of the canvas. Because a token grid's RoPE coordinate span is set by its patch count, **the reference has to be canvas-resolution for the per-tile slices to align.**
+
+- **Canvas-resolution reference** → each tile is given the matching slice of the reference. Correct and the recommended form. (Produce it in pixel space for best quality: decode → image upscale → re-encode at the target dimensions.)
+- **Non-canvas-resolution reference** → this fork now **resamples it up to the canvas resolution** before tiling, so it aligns (coverage 1.00) instead of devolving into noise. A one-time console note is printed when this happens. The latent-space resample is lower quality than a pixel-space upscale, so prefer the canvas-resolution form when you can.
+- **Different-aspect reference** (a genuine edit/Kontext image, not a downscale of the canvas) → left untouched and broadcast to every tile (the edit-model behaviour); a console note explains it isn't spatially tiled.
+
+> **Note**: a *correctly* tiled reference costs roughly **2× the tile's own token count** (the reference slice equals the image tile size) — this is intrinsic to reference-guided tiling, not specific to this fork. For **upscaling**, the reference-latent path is usually the wrong tool: upscale → VAE Encode → `latent_image` → **partial denoise** tiles a canvas-resolution latent with none of that overhead. The reference-latent path is for *edit* models injecting a separate image (Flux Kontext, Flux.2 Klein, Qwen-Image-Edit).
+
+> **Flux.2 memory**: Flux.2 uses `patch_size=1` (Flux.1 uses `2`), so latents tokenize ~4× more densely and high-resolution tiles are memory-heavy regardless of reference handling. The lever there is **smaller tiles** — tiling engages correctly; it just needs a smaller tile size on Flux.2 than you'd use on Flux.1.
+
 ### Pure-T2I tile coherence on Qwen-Image — caveats and Hi-Res Fix recipe
 
 The `rope_patch` in this fork fixes seams for Flux-family T2I and provides correct positional anchoring for Qwen-Image-Edit's reference latents. For **Qwen-Image base T2I with no ControlNet and no reference latent**, however, the patch is empirically a thin lever — tiles can still render independent renditions of the prompt's subject rather than a single coherent canvas.
