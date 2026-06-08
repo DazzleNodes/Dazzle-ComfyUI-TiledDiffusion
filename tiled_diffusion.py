@@ -530,6 +530,14 @@ class AbstractDiffusion:
         self.tile_bs = ceildiv(len(bboxes) , self.num_batches)          # optimal_batch_size
         self.batched_bboxes = [bboxes[i*self.tile_bs:(i+1)*self.tile_bs] for i in range(self.num_batches)]
 
+        # One concise line per render (this runs once per resolution, at grid
+        # init) so users can see the tiling plan -- how many tiles, what size,
+        # and the batch -- without guessing. Latent units.
+        _name = {'MixtureOfDiffusers': 'Mixture of Diffusers'}.get(self.method, self.method)
+        print(f"[TiledDiffusion] {_name}: canvas {self.w}x{self.h} latent, "
+              f"{self.num_tiles} tiles {self.tile_w}x{self.tile_h} "
+              f"(overlap {overlap}), batch {self.tile_bs} -> {self.num_batches} forward(s)/step")
+
     # detached version of above
     @grid_bbox
     def get_grid_bbox(self, tile_w: int, tile_h: int, overlap: int, tile_bs: int, w: int, h: int, 

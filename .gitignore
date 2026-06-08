@@ -165,3 +165,9 @@ backup*
 **/.vscode
 
 .*
+
+# Project-private workspace and local scratch -- NOT for the public remote.
+# Design docs, postmortems, commit-message drafts, issue drafts, and any
+# third-party data saved locally (e.g. user-supplied workflows / images).
+private/
+tests/one-offs/thinking/
