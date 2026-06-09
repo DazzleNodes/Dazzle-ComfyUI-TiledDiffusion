@@ -132,12 +132,28 @@ def analyze_axis(name, canvas_l, ref_l, tile_l, overlap_l, patch_size):
         ref_span_rs = img_span
         cov_rs = overlap_fraction(img_span, ref_span_rs)
 
+        # --- Option 2: keep the low-res slice (cheap, ref_p_sl patches) but RESCALE
+        # its RoPE coordinates so it spans the whole tile. process_img builds the
+        # span as linspace(offset, h_len-1+offset) with h_len = (h_len-1)*scale+1,
+        # so the span endpoint is offset + (ref_p-1)*scale. We compute that endpoint
+        # FROM the scale formula (not assert 1.0) to verify the formula is right.
+        ref_p_o2 = ref_p_sl
+        if ref_p_o2 > 1:
+            scale_o2 = (img_p - 1) / (ref_p_o2 - 1)
+        else:
+            scale_o2 = 1.0  # degenerate: 1-patch ref can't be stretched meaningfully
+        ref_span_o2 = (float(shift), shift + (ref_p_o2 - 1) * scale_o2)
+        cov_o2 = overlap_fraction(img_span, ref_span_o2)
+
         print(f"{i:>4} | {'broadcast':<10} | {ref_p_bc:>11} | {str(img_span):>14} | "
               f"{str(ref_span_bc):>16} | {cov_bc:>7.2f}")
         print(f"{'':>4} | {'slice (A)':<10} | {ref_p_sl:>11} | {str(img_span):>14} | "
               f"{str(ref_span_sl):>16} | {cov_sl:>7.2f}")
         print(f"{'':>4} | {'resamp (C)':<10} | {ref_p_rs:>11} | {str(img_span):>14} | "
               f"{str(ref_span_rs):>16} | {cov_rs:>7.2f}")
+        print(f"{'':>4} | {'option2':<10} | {ref_p_o2:>11} | {str(img_span):>14} | "
+              f"{'('+str(int(ref_span_o2[0]))+', '+f'{ref_span_o2[1]:.0f}'+')':>16} | "
+              f"{cov_o2:>7.2f}   scale={scale_o2:.2f}")
     return img_tiles
 
 
@@ -172,12 +188,21 @@ def token_and_memory_summary(canvas_hw, ref_hw, tile_hw, overlap_hw, patch_size)
           f"(+{100*ref_tokens_slice/img_tile_tokens:5.1f}% of tile)")
     print(f"ref tokens per tile [resamp C]  : {ref_tokens_resample:>8}  "
           f"(+{100*ref_tokens_resample/img_tile_tokens:5.1f}% of tile)")
+    # Option 2 uses the SAME tiny slice as 'slice A' (cheap), but aligned via RoPE
+    # rescale -> coverage 1.0. So its per-tile token cost == slice A's.
+    ref_tokens_option2 = ref_tokens_slice
+    print(f"ref tokens per tile [option2]   : {ref_tokens_option2:>8}  "
+          f"(+{100*ref_tokens_option2/img_tile_tokens:5.1f}% of tile)  "
+          f"<- aligned (coverage 1.0) AND cheap")
+    if ref_tokens_option2 > 0:
+        print(f"  option2 vs resamp C: {ref_tokens_resample/ref_tokens_option2:.1f}x fewer ref tokens/tile")
 
     # total ref tokens processed across the whole render (per step), a compute proxy
     print(f"\nTotal ref tokens across all tiles (per forward over the grid):")
     print(f"  broadcast : {ref_tokens_broadcast * n_tiles:>10}")
     print(f"  slice (A) : {ref_tokens_slice * n_tiles:>10}")
     print(f"  resamp (C): {ref_tokens_resample * n_tiles:>10}")
+    print(f"  option2   : {ref_tokens_option2 * n_tiles:>10}  (same as slice A, but aligned)")
 
     # Solution C transient: one canvas-sized ref latent resident (16 channels, fp16)
     canvas_ref_elems = 16 * ch * cw
@@ -187,39 +212,85 @@ def token_and_memory_summary(canvas_hw, ref_hw, tile_hw, overlap_hw, patch_size)
     print(f"  (held once per render, sliced per tile -- NOT per-tile resident)")
 
 
+# Per-model latent geometry (verified from ComfyUI source):
+#   Flux.1 / Qwen-Image: patch_size 2, VAE 8x downscale, 16-ch latent
+#   Flux.2:              patch_size 1, VAE 16x downscale, 128-ch latent
+# (Qwen is 5D [B,16,T,H,W] with T=1 for images, so spatial geometry == Flux.1.)
+MODELS = {
+    'flux1': {'patch': 2, 'downscale': 8,  'channels': 16},
+    'qwen':  {'patch': 2, 'downscale': 8,  'channels': 16},
+    'flux2': {'patch': 1, 'downscale': 16, 'channels': 128},
+}
+
+
+def run_one(canvas_l, ref_l, tile_l, overlap_l, patch_size):
+    analyze_axis('H', canvas_l[0], ref_l[0], tile_l[0], overlap_l, patch_size)
+    analyze_axis('W', canvas_l[1], ref_l[1], tile_l[1], overlap_l, patch_size)
+    token_and_memory_summary(tuple(canvas_l), tuple(ref_l), tuple(tile_l),
+                             (overlap_l, overlap_l), patch_size)
+
+
 def main():
     p = argparse.ArgumentParser()
-    p.add_argument('--canvas-latent', type=int, nargs=2, default=[384, 384],
-                   metavar=('H', 'W'), help='canvas latent H W (default 384 384 ~ 9MP/8)')
-    p.add_argument('--ref-latent', type=int, nargs=2, default=[128, 128],
-                   metavar=('H', 'W'), help='reference latent H W (default 128 128 ~ 1MP/8)')
-    p.add_argument('--tile-latent', type=int, nargs=2, default=[176, 176],
-                   metavar=('H', 'W'), help='tile latent H W (default 176 176)')
-    p.add_argument('--overlap-latent', type=int, default=48,
-                   help='tile overlap in latent units (default 48)')
-    p.add_argument('--patch-size', type=int, default=1,
-                   help='1 for Flux.2, 2 for Flux.1 (default 1)')
+    p.add_argument('--model', choices=list(MODELS), default=None,
+                   help='Set patch/downscale per model and interpret --*-px as PIXELS.')
+    p.add_argument('--canvas-px', type=int, nargs=2, metavar=('H', 'W'),
+                   help='canvas pixels H W (with --model)')
+    p.add_argument('--ref-px', type=int, nargs=2, metavar=('H', 'W'),
+                   help='reference pixels H W (with --model)')
+    p.add_argument('--tile-px', type=int, default=512, help='square tile pixels (with --model)')
+    p.add_argument('--overlap-px', type=int, default=64, help='tile overlap pixels (with --model)')
+    # legacy latent-space interface
+    p.add_argument('--canvas-latent', type=int, nargs=2, default=[384, 384], metavar=('H', 'W'))
+    p.add_argument('--ref-latent', type=int, nargs=2, default=[128, 128], metavar=('H', 'W'))
+    p.add_argument('--tile-latent', type=int, nargs=2, default=[176, 176], metavar=('H', 'W'))
+    p.add_argument('--overlap-latent', type=int, default=48)
+    p.add_argument('--patch-size', type=int, default=1)
+    p.add_argument('--adreitz-all', action='store_true',
+                   help="Run Adreitz's scenario (4032x2304 canvas, 1344x768 ref, 512px tiles) "
+                        "across flux1/qwen and flux2.")
     args = p.parse_args()
 
-    print("Reference-latent tiling geometry probe (Phase F1)")
-    print("Mirrors comfy/ldm/flux/model.py process_img() RoPE coordinate construction.")
-    print("coverage 1.00 == ref fully aligns with the image tile's coordinate range.")
-    print("coverage < 1.00 == ref only informs a SUB-REGION of the tile (misaligned).")
+    print("Reference-latent tiling geometry probe (G1: Option-2 verification)")
+    print("Mirrors process_img() RoPE coordinate construction (Flux + Qwen-Image).")
+    print("coverage 1.00 == ref fully spans the image tile's coordinate range.")
+    print("'option2' = low-res slice (cheap) + RoPE rescale -> coverage 1.00 by formula.\n")
 
-    analyze_axis('H', args.canvas_latent[0], args.ref_latent[0],
-                 args.tile_latent[0], args.overlap_latent, args.patch_size)
-    analyze_axis('W', args.canvas_latent[1], args.ref_latent[1],
-                 args.tile_latent[1], args.overlap_latent, args.patch_size)
+    if args.adreitz_all:
+        scen = {'canvas_px': (2304, 4032), 'ref_px': (768, 1344), 'tile_px': 512, 'overlap_px': 64}
+        for mdl in ('flux1', 'qwen', 'flux2'):
+            m = MODELS[mdl]; ds = m['downscale']; ps = m['patch']
+            cl = [scen['canvas_px'][0] // ds, scen['canvas_px'][1] // ds]
+            rl = [scen['ref_px'][0] // ds,    scen['ref_px'][1] // ds]
+            tl = [scen['tile_px'] // ds,      scen['tile_px'] // ds]
+            ol = scen['overlap_px'] // ds
+            print("\n" + "#" * 80)
+            print(f"# MODEL: {mdl}  (patch {ps}, {ds}x downscale, {m['channels']}ch) "
+                  f"-- canvas {cl} ref {rl} tile {tl} overlap {ol} latent")
+            print("#" * 80)
+            run_one(cl, rl, tl, ol, ps)
+        return 0
 
-    token_and_memory_summary(
-        tuple(args.canvas_latent), tuple(args.ref_latent),
-        tuple(args.tile_latent), (args.overlap_latent, args.overlap_latent),
-        args.patch_size)
+    if args.model:
+        m = MODELS[args.model]; ds = m['downscale']; ps = m['patch']
+        if not (args.canvas_px and args.ref_px):
+            print("--model requires --canvas-px and --ref-px"); return 1
+        cl = [args.canvas_px[0] // ds, args.canvas_px[1] // ds]
+        rl = [args.ref_px[0] // ds, args.ref_px[1] // ds]
+        tl = [args.tile_px // ds, args.tile_px // ds]
+        ol = args.overlap_px // ds
+        print(f"MODEL {args.model}: patch {ps}, {ds}x downscale -> canvas {cl} ref {rl} tile {tl} latent")
+        run_one(cl, rl, tl, ol, ps)
+        return 0
+
+    run_one(args.canvas_latent, args.ref_latent, args.tile_latent,
+            args.overlap_latent, args.patch_size)
 
     print("\nDecision read:")
-    print("  - If 'slice (A)' coverage < 1.00, naive slicing misaligns the ref (sub-region).")
-    print("  - 'resamp (C)' coverage should be 1.00 by construction (patch-grid parity).")
-    print("  - Compare ref-token columns for the memory tradeoff (correctness aside).")
+    print("  - 'slice (A)' coverage < 1.00 -> naive slicing misaligns (corner only).")
+    print("  - 'resamp (C)' coverage 1.00 by patch-grid parity, but full tile tokens.")
+    print("  - 'option2' coverage 1.00 (by the rescale formula) AND slice-A token cost.")
+    return 0
 
 
 if __name__ == '__main__':

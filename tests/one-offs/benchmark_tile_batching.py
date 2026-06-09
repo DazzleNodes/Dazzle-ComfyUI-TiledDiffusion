@@ -28,10 +28,14 @@ Decision rule:
 """
 
 import argparse
+import os
+import sys
 import time
 
 import torch
 import torch.nn as nn
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))   # so _probe_device imports
+from _probe_device import dev
 
 
 def make_block(hidden_dim, num_heads, dtype):
@@ -70,21 +74,21 @@ class TileMockModel(nn.Module):
 
 def benchmark_sequential(model, tiles):
     """tiles: list of (1, T, D) tensors. Run each through the model independently."""
-    torch.cuda.synchronize()
+    dev.synchronize()
     start = time.perf_counter()
     for tile in tiles:
         _ = model(tile)
-    torch.cuda.synchronize()
+    dev.synchronize()
     return time.perf_counter() - start
 
 
 def benchmark_batched(model, tiles):
     """tiles: list of (1, T, D) tensors. Concatenate to (N, T, D) and run one forward."""
     batched = torch.cat(tiles, dim=0)
-    torch.cuda.synchronize()
+    dev.synchronize()
     start = time.perf_counter()
     _ = model(batched)
-    torch.cuda.synchronize()
+    dev.synchronize()
     return time.perf_counter() - start
 
 
@@ -103,15 +107,15 @@ def main():
                    help='Run a sweep over (num_tiles, seq_len) to characterise speedup')
     args = p.parse_args()
 
-    if not torch.cuda.is_available():
-        print('CUDA not available -- this benchmark is meaningless on CPU.')
+    if not dev.available():
+        print('No CUDA or MPS device -- this benchmark is meaningless on CPU.')
         return 1
 
     dtype = {'bf16': torch.bfloat16, 'fp16': torch.float16, 'fp32': torch.float32}[args.dtype]
-    device = 'cuda'
+    device = dev.device
 
-    print(f'Device: {torch.cuda.get_device_name(0)}')
-    free, total = torch.cuda.mem_get_info()
+    print(f'Device: {dev.name()} [{dev.kind}]')
+    total = dev.mem_total(); free = total - dev.mem_used()
     print(f'GPU memory free: {free / 1024**3:.2f} GB / {total / 1024**3:.2f} GB')
     print()
 
@@ -154,10 +158,10 @@ def main():
         print(f'{label:<48s}{seq_min:>14.1f}{bat_min:>16.1f}{speedup:>11.2f}x')
 
         del tiles
-        torch.cuda.empty_cache()
+        dev.empty_cache()
 
     print()
-    peak_gb = torch.cuda.max_memory_allocated() / 1024**3
+    peak_gb = dev.peak_allocated() / 1024**3
     print(f'Peak GPU memory allocated this run: {peak_gb:.2f} GB')
     print()
     print('Decision rule:')

@@ -24,8 +24,41 @@ import sys
 import types
 import importlib.util
 
-REPO = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-COMFY = r"C:\code\ComfyUI_experiment"
+def _find_repo():
+    """Locate the TiledDiffusion repo (needs tiled_diffusion.py + utils.py).
+    Set TD_REPO to override; otherwise walk up from this file (works when run
+    from inside an installed node's tests/one-offs/)."""
+    env = os.environ.get("TD_REPO")
+    if env and os.path.isfile(os.path.join(env, "tiled_diffusion.py")):
+        return env
+    d = os.path.dirname(os.path.abspath(__file__))
+    for _ in range(6):
+        if (os.path.isfile(os.path.join(d, "tiled_diffusion.py"))
+                and os.path.isfile(os.path.join(d, "utils.py"))):
+            return d
+        d = os.path.dirname(d)
+    raise SystemExit(
+        "Could not locate the TiledDiffusion repo (needs tiled_diffusion.py + utils.py).\n"
+        "Run this from inside the repo (e.g. its tests/one-offs/), or set TD_REPO=/path/to/repo.")
+
+
+def _find_comfy(repo):
+    """Locate ComfyUI (needs comfy/utils.py). Set COMFY_PATH to override; otherwise
+    walk up from the repo (the node usually lives under custom_nodes/)."""
+    cands = [os.environ.get("COMFY_PATH")]
+    d = repo
+    for _ in range(6):
+        cands.append(d)
+        d = os.path.dirname(d)
+    cands.append(r"C:\code\ComfyUI_experiment")   # local fallback
+    for c in cands:
+        if c and os.path.isfile(os.path.join(c, "comfy", "utils.py")):
+            return c
+    raise SystemExit("Could not locate ComfyUI (needs comfy/utils.py). Set COMFY_PATH=/path/to/ComfyUI.")
+
+
+REPO = _find_repo()
+COMFY = _find_comfy(REPO)
 sys.path.insert(0, COMFY)
 
 import torch
