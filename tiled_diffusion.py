@@ -1260,7 +1260,11 @@ class TiledDiffusion():
     @classmethod
     def IS_CHANGED(s, *args, **kwargs):
         for o in s.instances:
-            o.impl.reset()
+            # impl is only created in apply(); a freshly-created/recreated node
+            # registered in __init__ but not yet executed has no impl. Guard it.
+            impl = getattr(o, 'impl', None)
+            if impl is not None:
+                impl.reset()
         return ""
     
     def __init__(self) -> None:
