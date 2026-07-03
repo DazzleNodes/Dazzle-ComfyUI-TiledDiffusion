@@ -19,6 +19,11 @@ from math import pi
 # When on, MixtureOfDiffusers.__call__ logs per-section wall-clock timings each
 # step plus running totals every 10 calls. Off by default; zero overhead when
 # the flag is unset because every measurement is gated.
+# Diagnostic (slicing DWP 2026-07-03): TD_REF_NO_SLICE=1 hands every tile the
+# WHOLE canvas-resolution reference instead of its per-tile slice -- the
+# slice-vs-whole A/B for reference coherence. Read once at import; restart
+# ComfyUI to change. Default off (per-tile slicing, the normal path).
+_TD_REF_NO_SLICE = os.environ.get("TD_REF_NO_SLICE", "0") == "1"
 _TD_PROFILE = os.environ.get('TILED_DIFFUSION_PROFILE', '').lower() not in ('', '0', 'false', 'no', 'off')
 
 opt_C = 4
@@ -460,10 +465,18 @@ class AbstractDiffusion:
 
         if key not in self._ref_resample_warned:
             self._ref_resample_warned.add(key)
+            cf = can_w / max(1, ref_w)
+            # At large scale factors the resampled latent is statistically far
+            # smoother than any natural latent (measured ~10x at 3x) -- texture-
+            # dense regions can moire at high CFG. Surface the pixel-space route
+            # at the moment it matters.
+            tip = (f" Tip: at this scale (x{cf:.1f}) latent resampling softens fine detail and "
+                   f"can moire texture-dense regions at high CFG -- the pixel-space route avoids it."
+                   if cf >= 2.0 else "")
             print(f"[TiledDiffusion] Reference latent {ref_h}x{ref_w} != canvas {can_h}x{can_w}; "
                   f"resampling to canvas resolution so per-tile slices stay spatially aligned. "
                   f"For best quality supply a canvas-resolution reference "
-                  f"(decode -> image upscale -> re-encode at target dims).")
+                  f"(decode -> image upscale -> re-encode at target dims).{tip}")
 
         # common_upscale takes (samples, width, height, method, crop) and handles
         # both 4D and 5D latents (it folds any extra leading dims). Spatial-only.
@@ -871,6 +884,9 @@ class MultiDiffusion(AbstractDiffusion):
                             v = repeat_to_batch_size(v, x_tile.shape[0])
                     elif isinstance(v, list) and len(v) > 0 and all(isinstance(e, torch.Tensor) for e in v):
                         # List-of-tensor conditioning (e.g. Flux/Flux.2 ref_latents).
+                        # (list only: no ComfyUI-core cond is tuple-carried as of dd17debc;
+                        # if one appears, widen to (list, tuple) here and at the two
+                        # sibling branches, preserving the type on rebuild.)
                         # For 4D refs spatially aligned with x_in: tile with same bboxes so
                         # each tile only attends to its own reference region (I2I/edit speed).
                         # A non-canvas-resolution ref is first resampled to canvas res so the
@@ -880,7 +896,7 @@ class MultiDiffusion(AbstractDiffusion):
                         new_v = []
                         for e in v:
                             e = self._resample_ref_to_canvas(e, x_in)
-                            if len(e.shape) == len(x_tile.shape) and e.shape[-2:] == x_in.shape[-2:]:
+                            if (not _TD_REF_NO_SLICE) and len(e.shape) == len(x_tile.shape) and e.shape[-2:] == x_in.shape[-2:]:
                                 e = torch.cat([e[bbox.slicer] for bbox in bboxes], dim=0)
                             if e.shape[0] != x_tile.shape[0]:
                                 e = repeat_to_batch_size(e, x_tile.shape[0])
@@ -1057,7 +1073,7 @@ class SpotDiffusion(AbstractDiffusion):
                         new_v = []
                         for e in v:
                             e = self._resample_ref_to_canvas(e, x_in)
-                            if len(e.shape) == len(x_tile.shape) and e.shape[-2:] == x_in.shape[-2:]:
+                            if (not _TD_REF_NO_SLICE) and len(e.shape) == len(x_tile.shape) and e.shape[-2:] == x_in.shape[-2:]:
                                 e = e.roll(shifts=(sh_h, sh_w), dims=(-2,-1))
                                 e = torch.cat([e[bbox.slicer] for bbox in bboxes], dim=0)
                             if e.shape[0] != x_tile.shape[0]:
@@ -1196,9 +1212,16 @@ class MixtureOfDiffusers(AbstractDiffusion):
                             bboxes_ = bboxes
                             if v.shape[-2:] != x_in.shape[-2:]:
                                 cf = x_in.shape[-1] * self.compression // v.shape[-1] # compression factor
+                                # Clamp the scaled tile to the cond's own dims BEFORE building
+                                # the gaussian weight: get_grid_bbox clamps its bboxes internally,
+                                # so an unclamped weight would mismatch the bbox slice whenever
+                                # the scaled tile exceeds the cond tensor (clamp issue identified
+                                # in upstream PR shiimizu#79 by xmarre).
+                                tile_w = min(self.width // cf, v.shape[-1])
+                                tile_h = min(self.height // cf, v.shape[-2])
                                 bboxes_ = self.get_grid_bbox(
-                                    (tile_w := self.width // cf),
-                                    (tile_h := self.height // cf),
+                                    tile_w,
+                                    tile_h,
                                     self.overlap // cf,
                                     self.tile_batch_size,
                                     v.shape[-1],
@@ -1218,7 +1241,7 @@ class MixtureOfDiffusers(AbstractDiffusion):
                         new_v = []
                         for e in v:
                             e = self._resample_ref_to_canvas(e, x_in)
-                            if len(e.shape) == len(x_tile.shape) and e.shape[-2:] == x_in.shape[-2:]:
+                            if (not _TD_REF_NO_SLICE) and len(e.shape) == len(x_tile.shape) and e.shape[-2:] == x_in.shape[-2:]:
                                 e = torch.cat([e[bbox.slicer] for bbox in bboxes], dim=0)
                             if e.shape[0] != x_tile.shape[0]:
                                 e = repeat_to_batch_size(e, x_tile.shape[0])
