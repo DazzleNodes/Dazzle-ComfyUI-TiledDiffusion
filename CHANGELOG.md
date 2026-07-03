@@ -2,6 +2,12 @@
 
 All notable changes to this fork are documented here. Versioning begins at 0.2.0 (2026-07-02); the fork's earlier work — per-tile global RoPE for Flux/Qwen-Image-Edit, list-of-tensor reference-latent conditioning, Wan-family-VAE-aware ControlNet hint slicing, the reference resample-to-canvas fix, profiling tooling — predates versioning and is treated as the implicit 0.1.x line; see `git log` for that history.
 
+## [0.2.1] - 2026-07-03
+
+### Fixed
+
+- **Mixture-of-Diffusers gaussian blend weights** (fix by Adreitz, #5): the y-axis spread was computed from `tile_w` (non-square tiles got a near-flat y-gaussian), the y midpoint sat half a cell low (a 4.5x top-vs-bottom edge-weight asymmetry at tile 32, biasing vertical-seam blending toward the upper tile), and the distribution was unnormalized (cosmetic — MoD blending is scale-invariant). Each axis now uses its own dimension with symmetric `(n-1)/2` midpoints. Inherited from upstream's initial commit; verified numerically before adoption. Regression tests (`tests/test_gaussian_weights.py`) and a human checklist included.
+
 ## [0.2.0] - 2026-07-02
 
 ### Fixed

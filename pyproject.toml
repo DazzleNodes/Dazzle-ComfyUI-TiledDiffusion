@@ -1,7 +1,7 @@
 [project]
 name = "dazzle-comfyui-tileddiffusion"
 description = "Tiled Diffusion & VAE for ComfyUI (DazzleNodes fork): DiT/Flux/Qwen tiling with per-tile global RoPE, packed-latent-aware Flux.2 support, reference-latent tiling, and Wan-family ControlNet slicing"
-version = "0.2.0"
+version = "0.2.1"
 readme = "README.md"
 license = { text = "GPL-3.0-only (project) / CC-BY-NC-SA-4.0 (algorithm code from multidiffusion-upscaler-for-automatic1111)" }
 requires-python = ">=3.10"

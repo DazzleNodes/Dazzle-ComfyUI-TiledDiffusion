@@ -819,9 +819,13 @@ def gaussian_weights(tile_w:int, tile_h:int) -> Tensor:
     This generates gaussian weights to smooth the noise of each tile.
     This is critical for this method to work.
     '''
-    f = lambda x, midpoint, var=0.01: exp(-(x-midpoint)*(x-midpoint) / (tile_w*tile_w) / (2*var)) / sqrt(2*pi*var)
-    x_probs = [f(x, (tile_w - 1) / 2) for x in range(tile_w)]   # -1 because index goes from 0 to latent_width - 1
-    y_probs = [f(y,  tile_h      / 2) for y in range(tile_h)]
+    # Per-axis variance, symmetric midpoints, normalized (fix by Adreitz, issue #5;
+    # the A1111-extension lineage collapsed albarji's two per-axis formulas into one
+    # lambda, leaving y-variance driven by tile_w; albarji's own tiling.py already
+    # had the y-midpoint off by half a cell).
+    f = lambda x, midpoint, tile_dim, var=0.01: exp(-(x-midpoint)*(x-midpoint) / (2*var*tile_dim*tile_dim)) / (sqrt(2*pi*var)*tile_dim)
+    x_probs = [f(x, (tile_w - 1) / 2, tile_w) for x in range(tile_w)]   # -1 because index goes from 0 to latent_width - 1
+    y_probs = [f(y, (tile_h - 1) / 2, tile_h) for y in range(tile_h)]   # -1 because index goes from 0 to latent_height - 1
 
     w = np.outer(y_probs, x_probs)
     return torch.from_numpy(w).to(devices.device, dtype=torch.float32)
