@@ -1,0 +1,31 @@
+[project]
+name = "dazzle-comfyui-tileddiffusion"
+description = "Tiled Diffusion & VAE for ComfyUI (DazzleNodes fork): DiT/Flux/Qwen tiling with per-tile global RoPE, packed-latent-aware Flux.2 support, reference-latent tiling, and Wan-family ControlNet slicing"
+version = "0.2.0"
+readme = "README.md"
+license = { file = "LICENSE" }
+requires-python = ">=3.10"
+
+# No pip dependencies - all dependencies provided by ComfyUI
+dependencies = []
+
+# Optional development dependencies
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0.0",
+]
+
+[project.urls]
+Repository = "https://github.com/DazzleNodes/Dazzle-ComfyUI-TiledDiffusion"
+Issues = "https://github.com/DazzleNodes/Dazzle-ComfyUI-TiledDiffusion/issues"
+Changelog = "https://github.com/DazzleNodes/Dazzle-ComfyUI-TiledDiffusion/blob/main/CHANGELOG.md"
+Documentation = "https://github.com/DazzleNodes/Dazzle-ComfyUI-TiledDiffusion#readme"
+
+# ComfyUI Registry Configuration
+# See: https://docs.comfy.org/registry/publishing
+[tool.comfy]
+PublisherId = "djdarcy"
+DisplayName = "Tiled Diffusion & VAE (DazzleNodes)"
+Icon = ""
+
+# Publishing: Update version in this file and push to main branch

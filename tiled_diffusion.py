@@ -253,6 +253,10 @@ class AbstractDiffusion:
         # non-canvas reference-latent resample path, so the console gets one
         # message per distinct mismatch instead of one per tile per step.
         self._ref_resample_warned: set = set()
+        # Flux.2-family 2x2-packed latent (128ch/16x); set in apply(), preserved
+        # across reset(). Controls unpacked-space ref resampling.
+        self.latent_is_packed_2x2: bool = False
+        self._refs_logged: bool = False
 
         # S1 profiler state (only populated when _TD_PROFILE is True).
         self._prof_calls: int = 0
@@ -286,9 +290,11 @@ class AbstractDiffusion:
         tile_batch_size = self.tile_batch_size
         compression = self.compression
         width = self.width
-        height  = self.height 
+        height  = self.height
         overlap = self.overlap
+        packed = self.latent_is_packed_2x2
         self.__init__()
+        self.latent_is_packed_2x2 = packed
         self.compression = compression
         self.width = width
         self.height  = height
@@ -386,6 +392,16 @@ class AbstractDiffusion:
         tf['rope_options'] = rope_opts
         c_tile['transformer_options'] = tf
 
+    def _log_refs_once(self, refs) -> None:
+        """One-time console note: how many reference latents each tile carries and
+        their shapes. Makes ref count/geometry auditable from user logs."""
+        if self._refs_logged:
+            return
+        self._refs_logged = True
+        shapes = ", ".join("x".join(str(d) for d in e.shape) for e in refs if isinstance(e, torch.Tensor))
+        packed = " (packed 2x2 latent; unpacked-space resample)" if getattr(self, 'latent_is_packed_2x2', False) else ""
+        print(f"[TiledDiffusion] ref_latents: {len(refs)} reference(s) per tile [{shapes}]{packed}")
+
     def _resample_ref_to_canvas(self, e: 'Tensor', x_in: 'Tensor') -> 'Tensor':
         """Make a reference latent canvas-resolution so per-tile slicing aligns.
 
@@ -451,6 +467,24 @@ class AbstractDiffusion:
 
         # common_upscale takes (samples, width, height, method, crop) and handles
         # both 4D and 5D latents (it folds any extra leading dims). Spatial-only.
+        #
+        # Flux.2-family packed latents must be resampled in UNPACKED space: each
+        # of the 128 channels is a distinct 2x2 sub-position of the 32ch/8x VAE
+        # latent, and interpolating the packed planes independently phase-shifts
+        # the sub-planes against each other by (1 - 1/scale) VAE pixels -- a comb
+        # at the latent Nyquist (~16px image period; measured 40x the correct
+        # path's high-frequency floor at scale 3). This applies to ANY resample,
+        # integer scale or not, nearest-neighbor included. See
+        # tests/test_flux2_packed_resample.py. TD_FLUX2_PACKED_RESAMPLE=0 forces
+        # the legacy packed-space path (diagnostic A/B escape hatch).
+        if (getattr(self, 'latent_is_packed_2x2', False)
+                and e.dim() == 4 and e.shape[1] == 128
+                and os.environ.get("TD_FLUX2_PACKED_RESAMPLE", "1") != "0"):
+            b, _, h, w = e.shape
+            u = e.reshape(b, 32, 2, 2, h, w).permute(0, 1, 4, 2, 5, 3).reshape(b, 32, h * 2, w * 2)
+            u = common_upscale(u, can_w * 2, can_h * 2, "bilinear", "disabled")
+            return (u.reshape(b, 32, can_h, 2, can_w, 2).permute(0, 1, 3, 5, 2, 4)
+                     .reshape(b, 128, can_h, can_w))
         return common_upscale(e, can_w, can_h, "bilinear", "disabled")
 
     def _inject_structure_latent(self, c_tile: dict, x_tile: 'Tensor', x_in: 'Tensor', bboxes: 'List[BBox]') -> None:
@@ -841,6 +875,8 @@ class MultiDiffusion(AbstractDiffusion):
                         # each tile only attends to its own reference region (I2I/edit speed).
                         # A non-canvas-resolution ref is first resampled to canvas res so the
                         # slice below stays spatially aligned (Solution C; no-op if matched).
+                        if k == 'ref_latents':
+                            self._log_refs_once(v)
                         new_v = []
                         for e in v:
                             e = self._resample_ref_to_canvas(e, x_in)
@@ -1016,6 +1052,8 @@ class SpotDiffusion(AbstractDiffusion):
                         # List-of-tensor (Flux/Flux.2 ref_latents): tile spatially if aligned,
                         # then roll to match SpotDiffusion shift. A non-canvas-resolution ref
                         # is first resampled to canvas res (Solution C; no-op if matched).
+                        if k == 'ref_latents':
+                            self._log_refs_once(v)
                         new_v = []
                         for e in v:
                             e = self._resample_ref_to_canvas(e, x_in)
@@ -1175,6 +1213,8 @@ class MixtureOfDiffusers(AbstractDiffusion):
                         # List-of-tensor (Flux/Flux.2 ref_latents): tile spatially if aligned.
                         # A non-canvas-resolution ref is first resampled to canvas res so the
                         # slice below stays spatially aligned (Solution C; no-op if matched).
+                        if k == 'ref_latents':
+                            self._log_refs_once(v)
                         new_v = []
                         for e in v:
                             e = self._resample_ref_to_canvas(e, x_in)
@@ -1278,7 +1318,33 @@ class TiledDiffusion():
         else:
             self.impl = SpotDiffusion()
 
-        compression = 4 if "CASCADE" in str(model.model.model_type) else 8
+        # Widget px -> latent-cell conversion. Historically hardcoded 8, which is
+        # wrong for formats whose sampler-facing latent is not 8x: Flux.2 is 16
+        # px/cell (2x2-packed 32ch/8x VAE latent), ChromaRadiance is pixel-space
+        # (1), several video formats are 16/32. Read the model's own latent
+        # format (base-class default is 8, comfy/latent_formats.py); Cascade
+        # keeps its historic stage-B value.
+        latent_format = getattr(model.model, 'latent_format', None)
+        if "CASCADE" in str(model.model.model_type):
+            compression = 4
+        else:
+            compression = int(getattr(latent_format, 'spacial_downscale_ratio', 8) or 8)
+        if compression != 8:
+            print(f"[TiledDiffusion] {compression} px per latent cell (from model latent_format; "
+                  f"earlier builds assumed 8): tile {tile_width}x{tile_height}px -> "
+                  f"{max(1, tile_width // compression)}x{max(1, tile_height // compression)} latent cells, "
+                  f"overlap {tile_overlap}px -> {tile_overlap // compression} cells.")
+
+        # Flux.2-family packed latent: [B,128,H/16,W/16] is a 2x2 pixel-shuffle of
+        # the 32ch/8x VAE latent (pack: comfy/ldm/models/autoencoder.py encode tail;
+        # unpack: latent_formats.py Flux2.latent_rgb_factors_reshape). The
+        # (128ch, 16x) pair uniquely selects this format today; a future 128ch/16x
+        # UNPACKED format would need a revisit here. Keyed on the latent format,
+        # not the transformer module, because the same format is shared by
+        # non-flux-module models (e.g. Lens).
+        self.impl.latent_is_packed_2x2 = (
+            getattr(latent_format, 'latent_channels', 0) == 128
+            and getattr(latent_format, 'spacial_downscale_ratio', 0) == 16)
 
         # Detect Flux-like model (has process_img + RoPE via EmbedND).
         # When enabled, inject per-tile rope_options to preserve global RoPE coordinates,
@@ -1349,8 +1415,10 @@ class TiledDiffusion():
         else:
             self.impl.structure_latent = None
 
-        self.impl.tile_width = tile_width // compression
-        self.impl.tile_height = tile_height // compression
+        # max(1, ...): compression-32 formats (LTXV/HunyuanImage21) with small
+        # widget values would otherwise yield 0-cell tiles -> degenerate grid.
+        self.impl.tile_width = max(1, tile_width // compression)
+        self.impl.tile_height = max(1, tile_height // compression)
         self.impl.tile_overlap = tile_overlap // compression
         self.impl.tile_batch_size = effective_batch_size
 
