@@ -2,6 +2,13 @@
 
 All notable changes to this fork are documented here. Versioning begins at 0.2.0 (2026-07-02); the fork's earlier work — per-tile global RoPE for Flux/Qwen-Image-Edit, list-of-tensor reference-latent conditioning, Wan-family-VAE-aware ControlNet hint slicing, the reference resample-to-canvas fix, profiling tooling — predates versioning and is treated as the implicit 0.1.x line; see `git log` for that history.
 
+## [Unreleased]
+
+### Added
+
+- `tests/assets/avernus_cdb_cover_1024x1024.jpg` — detail-rich render-verification image (dark gradients + fine linework expose tile artifacts the default `example.png` hides), referenced from the examples README and checklists. Artwork (c) Dustin Darcy (*Avernus Cube*), test/demo use only, not under the code licenses.
+- `tests/verify_install.py` — one-command install/consistency check: prints the exact code version (git commit + content hash, so zip installs are identifiable) and runs the regression suites on the default torch device (doubles as an MPS math check on Apple Silicon).
+
 ## [0.2.1] - 2026-07-03
 
 ### Fixed

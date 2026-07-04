@@ -33,6 +33,8 @@ git clone https://github.com/DazzleNodes/Dazzle-ComfyUI-TiledDiffusion.git
 
 (If you have the upstream `ComfyUI-TiledDiffusion` installed, remove or disable it first — the node names overlap.)
 
+Verify the install (prints your code version and runs the regression tests): `python tests/verify_install.py` (use your ComfyUI venv's python).
+
 ## Quick Start
 
 **Which workflow?** Want your image upscaled *faithfully* — same picture, more detail? Use the **Hi-Res Fix** recipe below. Want a *new, bigger* image in the same spirit as a reference (Flux.2 / Kontext / Qwen-Edit)? Use the **reference** workflow. A reference guides *what kind* of image to make (subject, colors, lighting), not where everything goes; the Hi-Res Fix keeps the layout locked.

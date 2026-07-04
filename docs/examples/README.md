@@ -14,6 +14,8 @@ The Hi-Res Fix recipe as a graph: `LoadImage` (~1MP) → `ImageScale` to 2304x12
 
 **Set the positive prompt to describe YOUR input image** (it ships with a generic quality prompt, which is fine for low-denoise polish).
 
+**Good test source:** a detail-rich image ships at [`tests/assets/avernus_cdb_cover_1024x1024.jpg`](../../tests/assets/avernus_cdb_cover_1024x1024.jpg) — copy it into `ComfyUI/input/` and point `LoadImage` at it. Its smooth dark background and fine linework reveal tile artifacts that flat images (like the default `example.png`) hide.
+
 **`denoise` is the lever** (the KSampler ships at `0.18`): `~0.025` pure polish, composition untouched; `~0.18` fine detail, structure locked; `~0.28-0.42` more inventive; above `~0.6-0.8` tiles increasingly forget the structure.
 
 ## flux2-ref-tiled-upscale.json
