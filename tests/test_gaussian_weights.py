@@ -14,6 +14,13 @@ canvas.py twin has, a duplication Adreitz flagged in #5) had three defects:
 
 Runnable standalone (python tests/test_gaussian_weights.py) or via pytest.
 Needs ComfyUI importable (COMFY_PATH env to override discovery).
+
+RENDER GATE: these unit pins guarantee weight SHAPES, not render outcomes.
+Blend-weight changes have flipped full-denoise coherence before (2026-07-04:
+the mathematically-correct symmetric weights collaged a config the old
+asymmetric weights rendered coherently). Any change here additionally
+requires the render gate in the v0.2.3 checklist: partial-denoise hires,
+full-denoise reference at the matrix-C6 geometry, and non-square tiles.
 """
 import importlib.util
 import math
@@ -123,6 +130,35 @@ def test_5_x_profile_shape_unchanged():
     # rtol bounded by the module's float32 cast (measured deviation ~4e-8);
     # any real shape change is orders of magnitude larger.
     assert np.allclose(new_x, old_x, rtol=1e-6), "x-axis behavior changed -- fix is not y-only"
+
+
+def test_7_bias_zero_is_identity():
+    """seam_bias 0.0 must be byte-identical to the default (the #5-correct weights)."""
+    import torch as _t
+    a = TD.gaussian_weights(32, 32)
+    b = TD.gaussian_weights(32, 32, 0.0, 0.0)
+    assert _t.equal(a, b), "bias=0 changed the weights"
+
+
+def test_8_bias_half_y_reproduces_prefix_blend():
+    """bias_y=+0.5 on square tiles must reproduce the PRE-FIX blend behaviour
+    exactly: same midpoint (h/2), same variance (square: tile_w==tile_h), and
+    the normalization difference is a global scale that cancels in blending.
+    Pinned via blend fractions, the quantity that reaches pixels."""
+    w = W_bias(32, 32, 0.0, 0.5)
+    o = _old_weights(32, 32)
+    for arr in (w, o):
+        assert arr.shape == (32, 32)
+    fw = w[28:32, 16] / (w[28:32, 16] + w[0:4, 16])
+    fo = o[28:32, 16] / (o[28:32, 16] + o[0:4, 16])
+    assert np.allclose(fw, fo, rtol=1e-5), "bias 0.5-y does not reproduce pre-fix blending"
+    # and the raw maps agree up to the single global normalization factor
+    ratio = o / w
+    assert np.allclose(ratio, ratio[0, 0], rtol=1e-5), "difference is not a pure global scale"
+
+
+def W_bias(tw, th, bx, by):
+    return TD.gaussian_weights(tw, th, bx, by).cpu().double().numpy()
 
 
 if __name__ == "__main__":

@@ -299,8 +299,12 @@ class AbstractDiffusion:
         height  = self.height
         overlap = self.overlap
         packed = self.latent_is_packed_2x2
+        seam_bias_x = getattr(self, 'seam_bias_x', 0.0)
+        seam_bias_y = getattr(self, 'seam_bias_y', 0.0)
         self.__init__()
         self.latent_is_packed_2x2 = packed
+        self.seam_bias_x = seam_bias_x
+        self.seam_bias_y = seam_bias_y
         self.compression = compression
         self.width = width
         self.height  = height
@@ -833,7 +837,7 @@ class AbstractDiffusion:
 
 import numpy as np
 from numpy import pi, exp, sqrt
-def gaussian_weights(tile_w:int, tile_h:int) -> Tensor:
+def gaussian_weights(tile_w:int, tile_h:int, bias_x:float=0.0, bias_y:float=0.0) -> Tensor:
     '''
     Copy from the original implementation of Mixture of Diffusers
     https://github.com/albarji/mixture-of-diffusers/blob/master/mixdiff/tiling.py
@@ -845,8 +849,15 @@ def gaussian_weights(tile_w:int, tile_h:int) -> Tensor:
     # lambda, leaving y-variance driven by tile_w; albarji's own tiling.py already
     # had the y-midpoint off by half a cell).
     f = lambda x, midpoint, tile_dim, var=0.01: exp(-(x-midpoint)*(x-midpoint) / (2*var*tile_dim*tile_dim)) / (sqrt(2*pi*var)*tile_dim)
-    x_probs = [f(x, (tile_w - 1) / 2, tile_w) for x in range(tile_w)]   # -1 because index goes from 0 to latent_width - 1
-    y_probs = [f(y, (tile_h - 1) / 2, tile_h) for y in range(tile_h)]   # -1 because index goes from 0 to latent_height - 1
+    # bias_x/bias_y shift the blend-weight peak (in latent cells) right/down.
+    # 0.0 = mathematically centered (the #5-correct default). A small positive
+    # bias re-introduces a CONTROLLED version of the historic asymmetry as a
+    # tie-breaker for full-denoise tiled generation, where perfectly symmetric
+    # blending can let neighboring tiles deadlock into a collage (each step
+    # re-contests the blurred consensus). +0.5 on y reproduces the pre-fix
+    # blend behaviour exactly on square tiles.
+    x_probs = [f(x, (tile_w - 1) / 2 + bias_x, tile_w) for x in range(tile_w)]   # -1 because index goes from 0 to latent_width - 1
+    y_probs = [f(y, (tile_h - 1) / 2 + bias_y, tile_h) for y in range(tile_h)]   # -1 because index goes from 0 to latent_height - 1
 
     w = np.outer(y_probs, x_probs)
     return torch.from_numpy(w).to(devices.device, dtype=torch.float32)
@@ -1158,7 +1169,9 @@ class MixtureOfDiffusers(AbstractDiffusion):
 
         # weights for custom bboxes
         self.custom_weights: List[Tensor] = []
-        self.get_weight = gaussian_weights
+        self.seam_bias_x: float = 0.0
+        self.seam_bias_y: float = 0.0
+        self.get_weight = lambda w, h: gaussian_weights(w, h, self.seam_bias_x, self.seam_bias_y)
 
     def init_done(self):
         super().init_done()
@@ -1338,6 +1351,8 @@ class TiledDiffusion():
                 "optional": {
                                 "rope_patch": (["auto", "enable", "disable"], {"default": "auto", "tooltip": "Flux/DiT global RoPE per-tile rewrite. 'auto' enables for Flux models to fix seams. Forces tile_batch_size=1."}),
                                 "rope_scale": ("FLOAT", {"default": 1.0, "min": 0.25, "max": 4.0, "step": 0.05, "tooltip": "DyPE-style RoPE frequency scale. Set >1 when rendering above training resolution (e.g. 2.0 for 2x training res on Flux). 1.0 = off. Composes with per-tile shift. Ignored if an external DyPE node already sets scale_x/scale_y."}),
+                                "seam_bias_y": ("FLOAT", {"default": 0.0, "min": -1.5, "max": 1.5, "step": 0.05, "tooltip": "Experimental (Mixture of Diffusers only): shifts each tile's blend-weight peak DOWN by this many latent cells. 0 = mathematically centered weights. A small positive value (~0.5) acts as a tie-breaker that can restore coherence in full-denoise tiled generation at the cost of slightly asymmetric seams."}),
+                                "seam_bias_x": ("FLOAT", {"default": 0.0, "min": -1.5, "max": 1.5, "step": 0.05, "tooltip": "Experimental (Mixture of Diffusers only): shifts each tile's blend-weight peak RIGHT by this many latent cells. See seam_bias_y."}),
                                 "structure_latent": ("LATENT", {"tooltip": "Optional structural prior for non-CN T2I tile coherence. Wire a LATENT (typically: low-res non-tiled KSampler -> VAE Decode -> ImageScale to target dims -> VAE Encode) to provide per-tile spatial guidance via the model's ref_latents conditioning channel. Tiles each see the spatially-aligned slice of this latent. Composes with rope_patch and ControlNet. Best on RoPE DiT models (Qwen-Image, Flux). See README 'Pure-T2I tile coherence on Qwen-Image'."}),
                             }}
     RETURN_TYPES = ("MODEL",)
@@ -1358,7 +1373,7 @@ class TiledDiffusion():
     def __init__(self) -> None:
         self.__class__.instances.add(self)
 
-    def apply(self, model: ModelPatcher, method, tile_width, tile_height, tile_overlap, tile_batch_size, rope_patch="auto", rope_scale=1.0, structure_latent=None):
+    def apply(self, model: ModelPatcher, method, tile_width, tile_height, tile_overlap, tile_batch_size, rope_patch="auto", rope_scale=1.0, seam_bias_y=0.0, seam_bias_x=0.0, structure_latent=None):
         if method == "Mixture of Diffusers":
             self.impl = MixtureOfDiffusers()
         elif method == "MultiDiffusion":
@@ -1417,6 +1432,9 @@ class TiledDiffusion():
         self.impl.rope_flavour = rope_flavour
         self.impl.patch_size = getattr(diffusion_model, 'patch_size', 2) if diffusion_model is not None else 2
         self.impl.rope_scale = float(rope_scale)
+        # Seam-bias tie-breaker (MoD blend weights only; harmless no-op elsewhere)
+        self.impl.seam_bias_x = float(seam_bias_x)
+        self.impl.seam_bias_y = float(seam_bias_y)
         self.impl.diffusion_model = diffusion_model
 
         if enable_rope and rope_flavour == "qwen" and diffusion_model is not None:

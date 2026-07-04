@@ -2,6 +2,13 @@
 
 All notable changes to this fork are documented here. Versioning begins at 0.2.0 (2026-07-02); the fork's earlier work — per-tile global RoPE for Flux/Qwen-Image-Edit, list-of-tensor reference-latent conditioning, Wan-family-VAE-aware ControlNet hint slicing, the reference resample-to-canvas fix, profiling tooling — predates versioning and is treated as the implicit 0.1.x line; see `git log` for that history.
 
+## [0.2.3] - 2026-07-04
+
+### Added
+
+- **`seam_bias_y` / `seam_bias_x` widgets (experimental, Mixture of Diffusers)**: shift each tile's blend-weight peak down/right by N latent cells (default 0.0 = the mathematically centered #5-correct weights, byte-identical, pinned by test). Background: the v0.2.1 weights correction removed an accidental asymmetry that had been acting as a tile tie-breaker, and perfectly symmetric blending can deadlock weakly-anchored tiles into a collage in full-denoise reference workflows (A/B verified against an archived render: same config coherent on pre-fix weights, collage on corrected weights). `seam_bias_y=0.5` reproduces the historical blend behavior exactly on square tiles (pinned); recommended full-denoise ref recipe: `seam_bias_y 0.5` + cfg ~4. Verified alternatives needing no knob: `tile_overlap` ~128 (~1.6x slower) or the SpotDiffusion method (some composition drift). Ladder of six A/B renders in the v0.2.3 checklist.
+- **Coherence gate** (`tests/checklists/v0.2.3__Feature__seam-bias-and-coherence-gate.md`): a required render-verification matrix for any future blend-weight change — unit pins guarantee weight shapes, not render outcomes, and this class of regression is invisible to them.
+
 ## [0.2.2] - 2026-07-04
 
 ### Fixed
