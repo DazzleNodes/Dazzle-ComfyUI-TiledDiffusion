@@ -82,6 +82,7 @@ def pack(t):
 
 def _stub(packed=True):
     s = types.SimpleNamespace(latent_is_packed_2x2=packed, _ref_resample_warned=set(),
+                              _ref_resample_cache={},
                               _refs_logged=True)
     s._resample_ref_to_canvas = TD.AbstractDiffusion._resample_ref_to_canvas.__get__(s)
     return s

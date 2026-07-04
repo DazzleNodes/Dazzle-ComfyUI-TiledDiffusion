@@ -258,6 +258,7 @@ class AbstractDiffusion:
         # non-canvas reference-latent resample path, so the console gets one
         # message per distinct mismatch instead of one per tile per step.
         self._ref_resample_warned: set = set()
+        self._ref_resample_cache: dict = {}
         # Flux.2-family 2x2-packed latent (128ch/16x); set in apply(), preserved
         # across reset(). Controls unpacked-space ref resampling.
         self.latent_is_packed_2x2: bool = False
@@ -463,6 +464,21 @@ class AbstractDiffusion:
                       f"tiled. If it was meant as a structural guide, match the canvas aspect ratio.")
             return e
 
+        # Resample-once cache: the reference is constant for a whole sampling
+        # run, but this method is called per tile per step -- 1,000+ times on a
+        # large canvas, and the transient tensors measure ~28 GB of alloc/free
+        # churn per run at a 3x geometry. CUDA's allocator recycles that
+        # invisibly; the MPS allocator reportedly does not (issue #4). The key
+        # includes a 16-sample content fingerprint so a recycled data_ptr (a
+        # NEW ref reusing a freed allocation of the same shape) or an in-place
+        # edit cannot return a stale result. Capped FIFO; dies with the impl.
+        stride = max(1, e.numel() // 16)
+        fp = e.flatten()[::stride][:16]
+        ckey = (e.data_ptr(), tuple(e.shape), str(e.dtype), str(e.device), can_h, can_w)
+        hit = self._ref_resample_cache.get(ckey)
+        if hit is not None and torch.equal(hit[0], fp):
+            return hit[1]
+
         if key not in self._ref_resample_warned:
             self._ref_resample_warned.add(key)
             cf = can_w / max(1, ref_w)
@@ -496,9 +512,14 @@ class AbstractDiffusion:
             b, _, h, w = e.shape
             u = e.reshape(b, 32, 2, 2, h, w).permute(0, 1, 4, 2, 5, 3).reshape(b, 32, h * 2, w * 2)
             u = common_upscale(u, can_w * 2, can_h * 2, "bilinear", "disabled")
-            return (u.reshape(b, 32, can_h, 2, can_w, 2).permute(0, 1, 3, 5, 2, 4)
-                     .reshape(b, 128, can_h, can_w))
-        return common_upscale(e, can_w, can_h, "bilinear", "disabled")
+            out = (u.reshape(b, 32, can_h, 2, can_w, 2).permute(0, 1, 3, 5, 2, 4)
+                    .reshape(b, 128, can_h, can_w))
+        else:
+            out = common_upscale(e, can_w, can_h, "bilinear", "disabled")
+        if len(self._ref_resample_cache) >= 8:
+            self._ref_resample_cache.pop(next(iter(self._ref_resample_cache)))
+        self._ref_resample_cache[ckey] = (fp.clone(), out)
+        return out
 
     def _inject_structure_latent(self, c_tile: dict, x_tile: 'Tensor', x_in: 'Tensor', bboxes: 'List[BBox]') -> None:
         """

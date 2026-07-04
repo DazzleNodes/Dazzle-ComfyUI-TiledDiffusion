@@ -2,7 +2,11 @@
 
 All notable changes to this fork are documented here. Versioning begins at 0.2.0 (2026-07-02); the fork's earlier work — per-tile global RoPE for Flux/Qwen-Image-Edit, list-of-tensor reference-latent conditioning, Wan-family-VAE-aware ControlNet hint slicing, the reference resample-to-canvas fix, profiling tooling — predates versioning and is treated as the implicit 0.1.x line; see `git log` for that history.
 
-## [Unreleased]
+## [0.2.2] - 2026-07-04
+
+### Fixed
+
+- **Reference-resample memory churn** (issue #4, MPS batch-over-batch growth): `_resample_ref_to_canvas` ran per tile per step -- 1,000+ identical recomputations per run at a 3x geometry, ~28 GB of transient alloc/free churn that CUDA's allocator recycles invisibly but the MPS allocator reportedly retains/fragments. The resampled reference is now cached once per run (fingerprint-keyed so a recycled `data_ptr` or in-place edit cannot serve a stale tensor; capped at 8 entries; byte-identical output pinned by test). Regression tests in `tests/test_ref_resample_cache.py`; suite wired into `verify_install.py`.
 
 ### Added
 

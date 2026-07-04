@@ -47,7 +47,7 @@ def main():
         return 1
 
     suites = ["test_gaussian_weights.py", "test_flux2_packed_resample.py",
-              "test_grid_bbox_weight_clamp.py"]
+              "test_grid_bbox_weight_clamp.py", "test_ref_resample_cache.py"]
     failures = 0
     import_error = None
     for name in suites:
