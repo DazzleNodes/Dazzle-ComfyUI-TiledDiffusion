@@ -2,6 +2,12 @@
 
 All notable changes to this fork are documented here. Versioning begins at 0.2.0 (2026-07-02); the fork's earlier work — per-tile global RoPE for Flux/Qwen-Image-Edit, list-of-tensor reference-latent conditioning, Wan-family-VAE-aware ControlNet hint slicing, the reference resample-to-canvas fix, profiling tooling — predates versioning and is treated as the implicit 0.1.x line; see `git log` for that history.
 
+## [0.2.5] - 2026-07-07
+
+### Fixed
+
+- **`TD_DIAG` memory line now prints at every run start.** The snapshot previously lived at grid init, which only executes on a resolution change -- so the documented "run twice and compare the memory lines" protocol produced no line on the second run. A run-boundary detector at the sampling wrapper (sigmas only decrease within a run; an increase marks a new run) now emits one `[TD-DIAG] run-start` line per run. Pinned by 3 tests (`tests/test_td_diag_run_tick.py`): silent when unset, one line per run, robust to partial-denoise starts and repeated equal sigmas.
+
 ## [0.2.4] - 2026-07-06
 
 ### Fixed

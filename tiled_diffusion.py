@@ -617,6 +617,22 @@ class AbstractDiffusion:
         if 'ref_latents_method' not in c_tile:
             c_tile['ref_latents_method'] = "index_timestep_zero"
 
+    def _td_diag_run_tick(self, t_in: Tensor):
+        # TD_DIAG run-boundary detector: sigmas only decrease within a sampling
+        # run, so an increase vs the previous call means a new run started.
+        # (init_grid_bbox only fires on resolution change, so it cannot serve
+        # as the per-run memory probe -- this can.)
+        if not _TD_DIAG:
+            return
+        try:
+            cur = float(t_in.max())
+        except Exception:
+            return
+        last = getattr(self, '_td_diag_last_sigma', None)
+        if last is None or cur > last:
+            print(f"[TD-DIAG] run-start: sigma={cur:.4f} | {_td_mem_snapshot()}")
+        self._td_diag_last_sigma = cur
+
     def init_grid_bbox(self, tile_w:int, tile_h:int, overlap:int, tile_bs:int):
         # if self._init_grid_bbox is not None: return
         # self._init_grid_bbox = True
@@ -907,6 +923,7 @@ class MultiDiffusion(AbstractDiffusion):
         t_in: Tensor = args["timestep"]
         c_in: dict = args["c"]
         cond_or_uncond: List = args["cond_or_uncond"]
+        self._td_diag_run_tick(t_in)
 
         N = x_in.shape[0]
         H, W = x_in.shape[-2:]
@@ -1042,6 +1059,7 @@ class SpotDiffusion(AbstractDiffusion):
         t_in: Tensor = args["timestep"]
         c_in: dict = args["c"]
         cond_or_uncond: List = args["cond_or_uncond"]
+        self._td_diag_run_tick(t_in)
 
         N = x_in.shape[0]
         H, W = x_in.shape[-2:]
@@ -1227,6 +1245,7 @@ class MixtureOfDiffusers(AbstractDiffusion):
 
     @torch.inference_mode()
     def __call__(self, model_function: BaseModel.apply_model, args: dict):
+        self._td_diag_run_tick(args["timestep"])
         if _TD_PROFILE:
             prof = {'setup': 0.0, 'x_tile': 0.0, 'c_tile': 0.0, 'cnet': 0.0,
                     'rope': 0.0, 'slat': 0.0, 'model': 0.0, 'debat': 0.0}
