@@ -2,6 +2,18 @@
 
 All notable changes to this fork are documented here. Versioning begins at 0.2.0 (2026-07-02); the fork's earlier work — per-tile global RoPE for Flux/Qwen-Image-Edit, list-of-tensor reference-latent conditioning, Wan-family-VAE-aware ControlNet hint slicing, the reference resample-to-canvas fix, profiling tooling — predates versioning and is treated as the implicit 0.1.x line; see `git log` for that history.
 
+## [0.2.4] - 2026-07-06
+
+### Fixed
+
+- **Model weights pinned across runs (issue #4, the run-2 memory step on MPS):** the per-tile RoPE machinery stored a strong reference to the diffusion model module on the tiling impl, which survives between runs inside ComfyUI's loaded-model registry (via the unet-function wrapper). With unload nodes in the workflow (UnloadModel / UnloadAllModels), the next run reloads the model while the old copy stays pinned -- two resident copies, ~30 GB for Flux.2, exactly one stale copy at a time (replaced per run, hence flat-after-run-2). Now a weakref: unload actually frees; sampling is unaffected (the model is strongly held by ComfyUI during a run). Matches the reporter's signature: +25-33 GB at run 2 then flat, clean on pre-RoPE builds.
+- **Mid-run canvas refresh dropped the RoPE configuration** (pre-existing since the April RoPE work): `reset()` now preserves rope flavour/scale, patch size, the model weakref, and structure_latent alongside the tile settings.
+- **Tiled VAE decode crashed on Flux.2's VAE** (`give_pre_end` attribute missing on the 32ch decoder): SD-era attributes are now getattr-guarded. Measured on a real 4032x2304 refine: our Tiled VAE Decode deviates from a single-pass decode by mean 1.3/255 (p99 5) vs ComfyUI core `VAEDecodeTiled`'s 4.8/255 (p99 23) -- 3.6x less of the per-tile color/brightness drift that reads as ghosting/halos on flat regions.
+
+### Added
+
+- **`TD_DIAG=1` env flag:** one-block diagnostic report -- node file hash, method/tile settings, latent_format (class/channels/ratio), computed compression, packed flag, rope state, seam biases, torch version, plus memory snapshots (cuda allocated/reserved or mps current/driver) at apply and at every run's grid init. Run a workflow twice and the pasted console shows cross-run retention directly. Restart ComfyUI after setting/unsetting (read at import).
+
 ## [0.2.3] - 2026-07-04
 
 ### Added
@@ -24,7 +36,7 @@ All notable changes to this fork are documented here. Versioning begins at 0.2.0
 
 ### Fixed
 
-- **Mixture-of-Diffusers gaussian blend weights** (fix by Adreitz, #5): the y-axis spread was computed from `tile_w` (non-square tiles got a near-flat y-gaussian), the y midpoint sat half a cell low (a 4.5x top-vs-bottom edge-weight asymmetry at tile 32, biasing vertical-seam blending toward the upper tile), and the distribution was unnormalized (cosmetic — MoD blending is scale-invariant). Each axis now uses its own dimension with symmetric `(n-1)/2` midpoints. Inherited from upstream's initial commit; verified numerically before adoption. Regression tests (`tests/test_gaussian_weights.py`) and a human checklist included.
+- **Mixture-of-Diffusers gaussian blend weights** (fix by Adreitz, #5; the per-axis variance defect was independently caught upstream in [shiimizu#77](https://github.com/shiimizu/ComfyUI-TiledDiffusion/pull/77) by pfpb): the y-axis spread was computed from `tile_w` (non-square tiles got a near-flat y-gaussian), the y midpoint sat half a cell low (a 4.5x top-vs-bottom edge-weight asymmetry at tile 32, biasing vertical-seam blending toward the upper tile), and the distribution was unnormalized (cosmetic — MoD blending is scale-invariant). Each axis now uses its own dimension with symmetric `(n-1)/2` midpoints. Inherited from upstream's initial commit; verified numerically before adoption. Regression tests (`tests/test_gaussian_weights.py`) and a human checklist included.
 
 ## [0.2.0] - 2026-07-02
 

@@ -1,4 +1,5 @@
 import os
+import weakref
 import time
 import torch
 from torch import Tensor
@@ -24,6 +25,24 @@ from math import pi
 # slice-vs-whole A/B for reference coherence. Read once at import; restart
 # ComfyUI to change. Default off (per-tile slicing, the normal path).
 _TD_REF_NO_SLICE = os.environ.get("TD_REF_NO_SLICE", "0") == "1"
+# Diagnostic (issue #4 remote debugging): TD_DIAG=1 prints a one-block config
+# report at apply() and a per-run memory snapshot at grid init -- run twice and
+# the second run's numbers reveal cross-run retention. Read once at import;
+# restart ComfyUI to change.
+_TD_DIAG = os.environ.get("TD_DIAG", "0") == "1"
+
+def _td_mem_snapshot():
+    try:
+        if torch.cuda.is_available():
+            return (f"cuda allocated={torch.cuda.memory_allocated()/2**30:.2f}GB "
+                    f"reserved={torch.cuda.memory_reserved()/2**30:.2f}GB")
+        mps = getattr(torch.backends, "mps", None)
+        if mps is not None and torch.backends.mps.is_available():
+            return (f"mps current={torch.mps.current_allocated_memory()/2**30:.2f}GB "
+                    f"driver={torch.mps.driver_allocated_memory()/2**30:.2f}GB")
+    except Exception as e:
+        return f"mem n/a ({e})"
+    return "mem n/a (cpu)"
 _TD_PROFILE = os.environ.get('TILED_DIFFUSION_PROFILE', '').lower() not in ('', '0', 'false', 'no', 'off')
 
 opt_C = 4
@@ -243,7 +262,14 @@ class AbstractDiffusion:
         self.rope_flavour: str = "flux"
         # Reference to the diffusion_model instance (set in apply()) so we can stash per-tile
         # state for the Qwen process_img monkey-patch.
-        self.diffusion_model = None
+        # WEAK reference to the diffusion model module (issue #4: a strong ref
+        # here can pin an unloaded model's weights across runs -- ~30 GB for
+        # Flux.2 -- because this impl survives inside ComfyUI's loaded-model
+        # registry via the unet-function wrapper. weakref lets unload nodes /
+        # model management actually free the module; during sampling the model
+        # is strongly held by ComfyUI itself, so the deref below never fails
+        # mid-run.)
+        self.diffusion_model_ref = None
         # Static DyPE-style RoPE scale (>1 stretches positional frequencies to help
         # pretrained models generate above training resolution). Applied only if
         # an external DyPE node hasn't already set scale_x/scale_y. (Flux only.)
@@ -301,10 +327,16 @@ class AbstractDiffusion:
         packed = self.latent_is_packed_2x2
         seam_bias_x = getattr(self, 'seam_bias_x', 0.0)
         seam_bias_y = getattr(self, 'seam_bias_y', 0.0)
+        # apply()-configured attrs must survive a mid-run canvas refresh
+        keep = {k: getattr(self, k) for k in (
+            'rope_per_tile', 'rope_flavour', 'patch_size', 'rope_scale',
+            'diffusion_model_ref', 'structure_latent') if hasattr(self, k)}
         self.__init__()
         self.latent_is_packed_2x2 = packed
         self.seam_bias_x = seam_bias_x
         self.seam_bias_y = seam_bias_y
+        for k, v in keep.items():
+            setattr(self, k, v)
         self.compression = compression
         self.width = width
         self.height  = height
@@ -369,10 +401,11 @@ class AbstractDiffusion:
         if self.rope_flavour == "qwen":
             # Stash per-tile state on the diffusion_model; our monkey-patched
             # process_img consumes it (one-shot) on the next forward call.
-            if self.diffusion_model is not None:
+            dm = self.diffusion_model_ref() if self.diffusion_model_ref is not None else None
+            if dm is not None:
                 canvas_h_len = max(1, (int(self.h) + (ps // 2)) // ps)
                 canvas_w_len = max(1, (int(self.w) + (ps // 2)) // ps)
-                self.diffusion_model._td_tile_state = {
+                dm._td_tile_state = {
                     'h_offset_pixels': int(bbox.y),
                     'w_offset_pixels': int(bbox.x),
                     'canvas_h_len': canvas_h_len,
@@ -609,6 +642,8 @@ class AbstractDiffusion:
         print(f"[TiledDiffusion] {_name}: canvas {self.w}x{self.h} latent, "
               f"{self.num_tiles} tiles {self.tile_w}x{self.tile_h} "
               f"(overlap {overlap}), batch {self.tile_bs} -> {self.num_batches} forward(s)/step")
+        if _TD_DIAG:
+            print(f"[TD-DIAG] run-init: {_td_mem_snapshot()}")
 
     # detached version of above
     @grid_bbox
@@ -1435,7 +1470,7 @@ class TiledDiffusion():
         # Seam-bias tie-breaker (MoD blend weights only; harmless no-op elsewhere)
         self.impl.seam_bias_x = float(seam_bias_x)
         self.impl.seam_bias_y = float(seam_bias_y)
-        self.impl.diffusion_model = diffusion_model
+        self.impl.diffusion_model_ref = weakref.ref(diffusion_model) if diffusion_model is not None else None
 
         if enable_rope and rope_flavour == "qwen" and diffusion_model is not None:
             _install_qwen_rope_monkeypatch(diffusion_model)
@@ -1494,6 +1529,21 @@ class TiledDiffusion():
         self.impl.overlap = tile_overlap
 
         model = model.clone()
+        if _TD_DIAG:
+            import hashlib as _hashlib
+            try:
+                with open(__file__, "rb") as _fh:
+                    _fhash = _hashlib.sha256(_fh.read()).hexdigest()[:12]
+            except Exception:
+                _fhash = "unknown"
+            _lf = getattr(model.model, "latent_format", None)
+            print(f"[TD-DIAG] apply: node sha256:{_fhash} | method={method} | "
+                  f"tile={tile_width}x{tile_height}px overlap={tile_overlap} batch={tile_batch_size} | "
+                  f"latent_format={type(_lf).__name__} ch={getattr(_lf, 'latent_channels', '?')} "
+                  f"ratio={getattr(_lf, 'spacial_downscale_ratio', '?')} compression={compression} "
+                  f"packed={self.impl.latent_is_packed_2x2} | "
+                  f"rope={self.impl.rope_flavour if self.impl.rope_per_tile else 'off'} "
+                  f"bias=({seam_bias_x},{seam_bias_y}) | torch={torch.__version__} | {_td_mem_snapshot()}")
         model.set_model_unet_function_wrapper(self.impl)
         model.model_options['tiled_diffusion'] = True
         return (model,)

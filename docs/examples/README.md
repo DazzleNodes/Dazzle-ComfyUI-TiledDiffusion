@@ -23,7 +23,7 @@ The Hi-Res Fix recipe as a graph: `LoadImage` (~1MP) → `ImageScale` to 2304x12
 A self-contained reference-latent tiled upscale — the distilled form of the issue #4 workflow, matching its exact geometry (1344x768 base, 3x canvas). Two stages sharing one prompt:
 
 1. **Base pass** — a normal 1344x768 (~1MP) generation (fixed seed).
-2. **Tiled pass** — the base *latent* is wired through `ReferenceLatent`, and a full-denoise render runs on a 4032x2304 canvas with the `TiledDiffusion`-patched model.
+2. **Tiled pass** — the base *latent* is wired through `ReferenceLatent`, and a full-denoise render runs on a 4032x2304 canvas with the `TiledDiffusion`-patched model. The workflow ships the verified coherence recipe: `seam_bias_y 0.5` with cfg 4 (see the note below on why full-denoise tiling wants a tie-breaker).
 
 Both stages save images so you can see exactly what the reference carries. **Set expectations correctly for denoise 1.0:** the tiled render is a *new image guided by* the reference — subject, palette, lighting, and scene character follow the base, but composition is NOT locked (a reference is strong image-prompting, not img2img). If you want the upscale to preserve the base's exact composition, that is the other workflow's job (`hires-fix-tiled-refine.json`, structure in the init latent) — or combine both: feed the upscaled base as the `latent_image` at partial denoise *and* keep the reference attached. (For a lighter run, lower both canvases together, e.g. 768x432 base / 2304x1296 tiled.)
 

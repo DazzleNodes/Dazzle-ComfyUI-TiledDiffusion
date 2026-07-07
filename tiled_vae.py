@@ -272,11 +272,12 @@ def build_task_queue(net, is_decoder):
     # because encoder and decoder share the same architecture, we extract the sampling part
     build_sampling(task_queue, net, is_decoder)
 
-    if not is_decoder or not net.give_pre_end:
+    # getattr guards: Flux.2's 32ch decoder lacks the SD-era give_pre_end/tanh_out attrs
+    if not is_decoder or not getattr(net, 'give_pre_end', False):
         task_queue.append(('pre_norm', net.norm_out))
         task_queue.append(('silu', inplace_nonlinearity))
         task_queue.append(('conv_out', net.conv_out))
-        if is_decoder and net.tanh_out:
+        if is_decoder and getattr(net, 'tanh_out', False):
             task_queue.append(('tanh', torch.tanh))
 
     return task_queue
