@@ -34,8 +34,14 @@ _TD_DIAG = os.environ.get("TD_DIAG", "0") == "1"
 def _td_mem_snapshot():
     try:
         if torch.cuda.is_available():
+            # mem_get_info is driver-level truth: it sees every allocator
+            # (torch caching, cudaMallocAsync pools, weight streamers), so a
+            # pinned-model-copy event stays visible even when ComfyUI's
+            # default cudaMallocAsync backend hides it from the torch counters.
+            free, total = torch.cuda.mem_get_info()
             return (f"cuda allocated={torch.cuda.memory_allocated()/2**30:.2f}GB "
-                    f"reserved={torch.cuda.memory_reserved()/2**30:.2f}GB")
+                    f"reserved={torch.cuda.memory_reserved()/2**30:.2f}GB | "
+                    f"driver free={free/2**30:.2f}GB of {total/2**30:.2f}GB")
         mps = getattr(torch.backends, "mps", None)
         if mps is not None and torch.backends.mps.is_available():
             return (f"mps current={torch.mps.current_allocated_memory()/2**30:.2f}GB "

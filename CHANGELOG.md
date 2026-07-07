@@ -2,6 +2,12 @@
 
 All notable changes to this fork are documented here. Versioning begins at 0.2.0 (2026-07-02); the fork's earlier work — per-tile global RoPE for Flux/Qwen-Image-Edit, list-of-tensor reference-latent conditioning, Wan-family-VAE-aware ControlNet hint slicing, the reference resample-to-canvas fix, profiling tooling — predates versioning and is treated as the implicit 0.1.x line; see `git log` for that history.
 
+## [0.2.6] - 2026-07-07
+
+### Changed
+
+- **`TD_DIAG` CUDA snapshots now include driver-level numbers** (`driver free=X GB of Y GB` via `torch.cuda.mem_get_info`). ComfyUI enables the `cudaMallocAsync` allocator backend by default on supported GPUs (`cuda_malloc.py`), which makes `torch.cuda.memory_allocated/reserved` blind to most real usage -- field log showed 0.45 GB reported while ~23 GB of model weights were actively sampling. The driver-level query sees every allocator, so weights-class retention (the pinned-model-copy bug class from issue #4) stays visible on CUDA. The MPS branch already reported driver-level numbers.
+
 ## [0.2.5] - 2026-07-07
 
 ### Fixed

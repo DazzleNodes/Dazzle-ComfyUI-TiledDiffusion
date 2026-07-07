@@ -102,8 +102,20 @@ def test_3_partial_denoise_and_equal_sigmas():
     print("[PASS] test_3_partial_denoise_and_equal_sigmas")
 
 
+def test_4_mem_snapshot_driver_level():
+    td = _load_td(diag=True)
+    snap = td._td_mem_snapshot()
+    assert isinstance(snap, str) and snap, f"snapshot should be a non-empty string, got {snap!r}"
+    if torch.cuda.is_available():
+        # driver-level free/total must be present (sees allocators the torch
+        # counters miss, e.g. ComfyUI's default cudaMallocAsync backend)
+        assert "driver free=" in snap and " of " in snap, snap
+    print("[PASS] test_4_mem_snapshot_driver_level")
+
+
 if __name__ == "__main__":
     test_1_silent_when_flag_off()
     test_2_one_line_per_run()
     test_3_partial_denoise_and_equal_sigmas()
+    test_4_mem_snapshot_driver_level()
     print("ALL PASS")
