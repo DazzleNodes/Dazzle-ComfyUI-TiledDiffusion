@@ -17,8 +17,8 @@ Large-image drawing & upscaling with limited VRAM — extended for the DiT era. 
 
 ## Features
 
-- **Supported models**: SD1.x / SD2.x / SDXL / SD3, FLUX, **FLUX.2 / Klein** (T2I + I2I with reference latents), Qwen-Image-Edit, Qwen-Image base (see the [Hi-Res Fix recipe](#quick-start))
-- **Per-tile global RoPE** (`rope_patch`) — fixes the seams DiT models produce when every tile restarts its positions at (0,0); auto-detected for Flux-family and Qwen-Image-Edit
+- **Supported models**: SD1.x / SD2.x / SDXL / SD3, FLUX, **FLUX.2 / Klein** (T2I + I2I with reference latents), Qwen-Image-Edit, Qwen-Image base (see the [Hi-Res Fix recipe](#quick-start)), Qwen-Image 2.1
+- **Per-tile global RoPE** (`rope_patch`) — fixes the seams DiT models produce when every tile restarts its positions at (0,0); auto-detected for Flux-family, Qwen-Image-Edit, and Qwen-Image 2.1
 - **Reference-latent tiling** — each tile attends only to its spatially-aligned slice of the reference; non-canvas references are resampled correctly (packed-latent-aware on Flux.2)
 - **Correct tile sizes on every model** — widget pixels convert via the model's own latent format (Flux.2 is 16 px/cell; earlier builds assumed 8 everywhere, silently making Flux.2 tiles 4x heavier)
 - **ControlNet support** incl. Wan-family VAEs (5-D latent hints, tuple `downscale_ratio`)

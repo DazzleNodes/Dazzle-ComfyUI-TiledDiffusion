@@ -123,6 +123,142 @@ def _install_qwen_rope_monkeypatch(diffusion_model):
     diffusion_model._td_qwen_rope_installed = True
     diffusion_model._td_tile_state = None
 
+
+def _detect_rope_flavour(diffusion_model):
+    """
+    Pick the per-tile RoPE mechanism for a diffusion model.
+    Returns (flavour, supported): flavour in {"flux", "qwen", "qwen21"}.
+
+    - Flux / Flux.2: read transformer_options["rope_options"] directly.
+    - Qwen-Image: needs our patched process_img().
+    - Qwen-Image 2.1 (comfy.ldm.qwen_image21) shares the "qwen_image" module
+      prefix but has no process_img -- positions are built in build_sequence.
+      Duck-typed so a prefix match can't route it to the wrong patch again
+      (that routing was the 2.1 crash: AttributeError on process_img).
+    """
+    dm_module = type(diffusion_model).__module__ if diffusion_model is not None else ""
+    is_flux_like = dm_module.startswith("comfy.ldm.flux")
+    is_qwen21_like = (diffusion_model is not None
+                      and hasattr(diffusion_model, 'build_sequence')
+                      and hasattr(diffusion_model, 'pe_embedder')
+                      and not hasattr(diffusion_model, 'process_img'))
+    is_qwen_like = (dm_module.startswith("comfy.ldm.qwen_image") and not is_qwen21_like
+                    and hasattr(diffusion_model, 'process_img'))
+    if dm_module.startswith("comfy.ldm.qwen_image") and not (is_qwen_like or is_qwen21_like):
+        print(f"[TiledDiffusion] Unrecognised Qwen-Image variant ({type(diffusion_model).__name__}): "
+              f"per-tile RoPE patch unavailable; tiles will use the model's own positions.")
+    flavour = "qwen21" if is_qwen21_like else ("qwen" if is_qwen_like else "flux")
+    return flavour, (is_flux_like or is_qwen_like or is_qwen21_like)
+
+
+def _disable_qwen21_prefix_cache(model_options, diffusion_model):
+    """
+    Turn off Qwen-Image 2.1's prefix K/V cache on our patched clone.
+    Returns True when it did.
+
+    Why: ComfyUI's PoseBranchCache.select() moves a cache hit to the end with
+    self.slots.remove(s); list.remove compares slot dicts with ==, which
+    compares their tensor keys. A hit on any slot but the first raises
+    (keys of different lengths: shape mismatch). Untiled sampling alternates
+    cond/uncond so every hit is on slot 0; tiled sampling runs each cond for
+    every tile, so the second uncond hit is on slot 1 and crashes on the first
+    step. Repro: tests/one-offs/qwen21_prefix_cache_select_repro.py.
+    With the cache off, its key's blindness to our per-tile position shift
+    (bit-identical reference slices at different tiles) no longer matters.
+
+    Uses the same switch as ComfyUI's QwenImage21Cache node ("off" recomputes
+    the prefix each step); keeps any dtype the user chose. Revisit when the
+    upstream select() is fixed.
+    """
+    if diffusion_model is None or not hasattr(diffusion_model, 'select_prefix_cache'):
+        return False
+    tf = model_options.setdefault('transformer_options', {})
+    cache_opts = dict(tf.get('qwen_image21_cache', {}))
+    cache_opts['device'] = 'off'
+    tf['qwen_image21_cache'] = cache_opts
+    return True
+
+
+def _install_qwen21_rope_patch(diffusion_model):
+    """
+    Per-tile global RoPE for Qwen-Image 2.1 (comfy/ldm/qwen_image21/model.py).
+
+    2.1 has no process_img: build_sequence() builds text + reference + target
+    tokens in one sequence and centres every image grid's positions on 0
+    (row r of an h-row grid gets r - ceil(h/2)). A tile therefore gets
+    positions centred on the TILE; we move them to where the same cells sit
+    on the full canvas: shift = y0 - ceil(H/2) + ceil(h/2) (same for x).
+
+    Grids with the tile's shape (the target, plus reference slices our node
+    cut to match the tile) get that shift. Other-shaped grids (whole
+    references) stay centred on 0, which after the shift is the canvas
+    centre -- where a whole-image reference belongs. Text rows are untouched.
+
+    Implementation: capture the position ids build_sequence feeds to
+    pe_embedder, shift the image rows (located via the segments it returns;
+    image segments carry mask None), and rebuild pe. The rebuild layout is
+    verified against the model's own output once; on mismatch (an upstream
+    change) we warn and fall back to the unshifted result rather than guess.
+    """
+    if getattr(diffusion_model, '_td_qwen21_rope_installed', False):
+        return
+    original_build = diffusion_model.build_sequence
+    embedder = diffusion_model.pe_embedder
+
+    def patched_build_sequence(x, context, ref_latents, image_slots):
+        state = getattr(diffusion_model, '_td_tile_state', None)
+        if state is None or getattr(diffusion_model, '_td_qwen21_layout_bad', False):
+            return original_build(x, context, ref_latents, image_slots)
+        # one-shot: build_sequence runs once per forward
+        diffusion_model._td_tile_state = None
+
+        captured = {}
+        embed_forward = embedder.forward
+
+        def capture(ids):
+            out = embed_forward(ids)
+            captured['ids'], captured['raw'] = ids, out
+            return out
+
+        # restore exactly what was there (another extension may own an instance-level forward)
+        had_instance_forward = 'forward' in embedder.__dict__
+        embedder.forward = capture
+        try:
+            hidden_states, pe, segments = original_build(x, context, ref_latents, image_slots)
+        finally:
+            if had_instance_forward:
+                embedder.forward = embed_forward
+            else:
+                del embedder.forward
+
+        ids, raw = captured.get('ids'), captured.get('raw')
+        if ids is None or not torch.equal(raw.transpose(1, 2).contiguous(), pe):
+            diffusion_model._td_qwen21_layout_bad = True
+            print("[TiledDiffusion] Qwen-Image 2.1 RoPE patch: unexpected position layout "
+                  "(upstream model changed?) -- per-tile global RoPE disabled for this model.")
+            return hidden_states, pe, segments
+
+        h, w = x.shape[-2:]
+        ceil = lambda n: n - n // 2
+        dy = int(state['h_offset_pixels']) - ceil(int(state['canvas_h_len'])) + ceil(h)
+        dx = int(state['w_offset_pixels']) - ceil(int(state['canvas_w_len'])) + ceil(w)
+        if dy == 0 and dx == 0:
+            return hidden_states, pe, segments
+
+        ids = ids.clone()
+        grids = list(ref_latents) + [x]
+        image_segments = [s for s in segments if s[2] is None]
+        for (start, end, _), grid in zip(image_segments, grids):
+            if tuple(grid.shape[-2:]) == (h, w):
+                ids[:, start:end, 1] += dy
+                ids[:, start:end, 2] += dx
+        pe = embed_forward(ids).transpose(1, 2).contiguous()
+        return hidden_states, pe, segments
+
+    diffusion_model.build_sequence = patched_build_sequence
+    diffusion_model._td_qwen21_rope_installed = True
+    diffusion_model._td_tile_state = None
+
 from enum import Enum
 class BlendMode(Enum):  # i.e. LayerType
     FOREGROUND = 'Foreground'
@@ -404,9 +540,10 @@ class AbstractDiffusion:
         tf = c_tile.get('transformer_options', None)
         tf = dict(tf) if isinstance(tf, dict) else {}
 
-        if self.rope_flavour == "qwen":
-            # Stash per-tile state on the diffusion_model; our monkey-patched
-            # process_img consumes it (one-shot) on the next forward call.
+        if self.rope_flavour in ("qwen", "qwen21"):
+            # Stash per-tile state on the diffusion_model; our patched
+            # process_img (Qwen-Image) / build_sequence (2.1) consumes it
+            # (one-shot) on the next forward call.
             dm = self.diffusion_model_ref() if self.diffusion_model_ref is not None else None
             if dm is not None:
                 canvas_h_len = max(1, (int(self.h) + (ps // 2)) // ps)
@@ -1473,13 +1610,7 @@ class TiledDiffusion():
         # When enabled, inject per-tile rope_options to preserve global RoPE coordinates,
         # fixing seams caused by each tile restarting RoPE at (0,0).
         diffusion_model = getattr(model.model, 'diffusion_model', None)
-        dm_module = type(diffusion_model).__module__ if diffusion_model is not None else ""
-        # Flux: reads transformer_options["rope_options"] directly.
-        # Qwen-Image: needs our patched process_img() reading transformer_options["tile_rope"].
-        is_flux_like = dm_module.startswith("comfy.ldm.flux")
-        is_qwen_like = dm_module.startswith("comfy.ldm.qwen_image")
-        is_dit_supported = is_flux_like or is_qwen_like
-        rope_flavour = "qwen" if is_qwen_like else "flux"
+        rope_flavour, is_dit_supported = _detect_rope_flavour(diffusion_model)
 
         if rope_patch == "enable":
             enable_rope = True
@@ -1490,7 +1621,9 @@ class TiledDiffusion():
 
         self.impl.rope_per_tile = enable_rope
         self.impl.rope_flavour = rope_flavour
-        self.impl.patch_size = getattr(diffusion_model, 'patch_size', 2) if diffusion_model is not None else 2
+        # Qwen-Image 2.1 tokenises one latent cell per token (no patchify, no patch_size attr)
+        self.impl.patch_size = 1 if rope_flavour == "qwen21" else (
+            getattr(diffusion_model, 'patch_size', 2) if diffusion_model is not None else 2)
         self.impl.rope_scale = float(rope_scale)
         # Seam-bias tie-breaker (MoD blend weights only; harmless no-op elsewhere)
         self.impl.seam_bias_x = float(seam_bias_x)
@@ -1499,6 +1632,8 @@ class TiledDiffusion():
 
         if enable_rope and rope_flavour == "qwen" and diffusion_model is not None:
             _install_qwen_rope_monkeypatch(diffusion_model)
+        if enable_rope and rope_flavour == "qwen21" and diffusion_model is not None:
+            _install_qwen21_rope_patch(diffusion_model)
 
         # rope_per_tile requires one bbox per forward call so rope_options can differ per tile.
         effective_batch_size = 1 if enable_rope else tile_batch_size
@@ -1506,7 +1641,7 @@ class TiledDiffusion():
             print(f"[TiledDiffusion] {rope_flavour.title()} DiT RoPE patch enabled: forcing tile_batch_size=1 (was {tile_batch_size}) for per-tile global RoPE coordinates.")
         if enable_rope and rope_flavour == "flux" and float(rope_scale) != 1.0:
             print(f"[TiledDiffusion] RoPE scale = {rope_scale} (DyPE-style frequency stretch; set to 1.0 to disable).")
-        if enable_rope and rope_flavour == "qwen" and float(rope_scale) != 1.0:
+        if enable_rope and rope_flavour in ("qwen", "qwen21") and float(rope_scale) != 1.0:
             print(f"[TiledDiffusion] rope_scale is ignored for Qwen-Image (Flux-only).")
 
         # Optional structure_latent: apply latent-format normalization (matching what
@@ -1554,6 +1689,9 @@ class TiledDiffusion():
         self.impl.overlap = tile_overlap
 
         model = model.clone()
+        if _disable_qwen21_prefix_cache(model.model_options, getattr(model.model, 'diffusion_model', None)):
+            print("[TiledDiffusion] Qwen-Image 2.1: prefix K/V cache turned off for tiled sampling "
+                  "(ComfyUI's cache crashes on tiled access order); the text/reference prefix is recomputed each step.")
         if _TD_DIAG:
             import hashlib as _hashlib
             try:

@@ -2,6 +2,17 @@
 
 All notable changes to this fork are documented here. Versioning begins at 0.2.0 (2026-07-02); the fork's earlier work — per-tile global RoPE for Flux/Qwen-Image-Edit, list-of-tensor reference-latent conditioning, Wan-family-VAE-aware ControlNet hint slicing, the reference resample-to-canvas fix, profiling tooling — predates versioning and is treated as the implicit 0.1.x line; see `git log` for that history.
 
+## [0.2.7] - 2026-09-28
+
+### Fixed
+
+- **Qwen-Image 2.1 crashed on load** (`'QwenImage21Transformer2DModel' object has no attribute 'process_img'`). The node chose its RoPE patch by module-name prefix, and 2.1's module (`comfy.ldm.qwen_image21`) matched the original Qwen-Image's prefix, so 2.1 was sent to a patch that needs a method 2.1 doesn't have. Model routing now checks which methods the model actually has. An unrecognised Qwen-Image variant now prints a console note and runs with the model's own positions instead of crashing.
+- **Qwen-Image 2.1 crashed on the first sampling step when tiled** (`The size of tensor a ... must match the size of tensor b ...` inside ComfyUI's prefix cache). ComfyUI's 2.1 prefix K/V cache fails whenever a cache hit lands on any slot but the first. Untiled sampling alternates positive/negative prompts and never hits that; tiled sampling runs each prompt across every tile in turn and hits it on step one. The node now turns the cache off on its tiled model copy (the same switch as ComfyUI's `QwenImage21Cache` node set to `off`, keeping any dtype you chose) and says so in the console. Cost: the prompt prefix is recomputed each step.
+
+### Added
+
+- **Per-tile global RoPE for Qwen-Image 2.1.** 2.1 centres each image grid's positions on zero, so every tile was positioned as if it were the whole image. Tiles now get the positions their cells have on the full canvas. Reference slices cut to a tile's shape move with the tile; whole-image references stay centred on the canvas, and text positions are untouched. If a future ComfyUI changes 2.1's position layout, the node detects it, warns, and falls back to the model's own positions rather than applying a wrong shift.
+
 ## [0.2.6] - 2026-07-07
 
 ### Changed
