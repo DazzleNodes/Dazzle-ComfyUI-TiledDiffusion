@@ -2,6 +2,20 @@
 
 All notable changes to this fork are documented here. Versioning begins at 0.2.0 (2026-07-02); the fork's earlier work — per-tile global RoPE for Flux/Qwen-Image-Edit, list-of-tensor reference-latent conditioning, Wan-family-VAE-aware ControlNet hint slicing, the reference resample-to-canvas fix, profiling tooling — predates versioning and is treated as the implicit 0.1.x line; see `git log` for that history.
 
+## [0.3.0] - 2026-09-28
+
+### Added
+
+- **`dynamic_tiling` widget (opt-in, default 0 = off).** Set it to N and the node renders the whole canvas in one untiled pass when the canvas is at most N tiles' worth of area (canvas width x height / tile width x height) **and** ComfyUI's own memory estimate says it fits (the same check ComfyUI uses to batch prompts, with its 1.5x margin). Otherwise it tiles as before. It is for canvases only a little bigger than one tile, where tiling costs time and, at high denoise, can give each tile its own copy of the subject: a 1792x1200 Qwen-Image 2.1 render that duplicated its subject as 2 tiles came out as one subject in a single pass, and faster (21 s vs 29 s sampling). Large canvases stay tiled even when they would fit in memory (e.g. 4032x2304 with 512 px tiles is 35 tiles' worth). The choice is made once per run and printed to the console. A connected `structure_latent` always tiles, since it only works per tile. README has a worked example.
+
+### Changed
+
+- **Console messages printed during sampling now start on their own line** instead of being appended to the end of the sampler's progress bar (`...it/s][TiledDiffusion] ...`). Messages printed when the node is applied are unchanged.
+
+### Docs
+
+- README options table now lists `seam_bias_y` / `seam_bias_x` (added in 0.2.3) and `dynamic_tiling`.
+
 ## [0.2.7] - 2026-09-28
 
 ### Fixed

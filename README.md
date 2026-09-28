@@ -59,6 +59,19 @@ Verify the install (prints your code version and runs the regression tests): `py
 | `rope_patch`      | *(optional, DiT)* `auto` \| `enable` \| `disable`. Per-tile global RoPE rewrite; `auto` enables for supported DiT models. Forces `tile_batch_size=1`. |
 | `rope_scale`      | *(optional, Flux only)* DyPE-style RoPE frequency scale for rendering above training resolution. `1.0` = off. |
 | `structure_latent`| *(optional, experimental)* Canvas-sized structural prior injected per-tile via `ref_latents`. For ref-trained models only — see [docs/technical.md](docs/technical.md). |
+| `seam_bias_y` / `seam_bias_x` | *(optional, experimental, Mixture of Diffusers)* Shift each tile's blend peak down/right by this many latent cells. `0` = centred. `seam_bias_y 0.5` with cfg ~4 rescues full-denoise reference renders that break into a tile collage — see [docs/examples](docs/examples/README.md). |
+| `dynamic_tiling`  | *(optional)* `0` = off (always tile). `N > 0`: render the whole canvas in **one untiled pass** when it is at most **N tiles' worth of area** and fits in memory. See below. |
+
+**Dynamic tiling:** `N` compares the canvas to one tile by area: canvas width × height ÷ (tile width × tile height). With `dynamic_tiling = 2`:
+
+| Canvas | Tile | Tiles' worth | Result |
+|---|---|---|---|
+| 1792×1200 | 1408×1408 | 1.1 | one untiled pass |
+| 1536×1024 | 1024×1024 | 1.5 | one untiled pass |
+| 2048×1536 | 1024×1024 | 3.0 | tiled |
+| 4032×2304 | 512×512 | 35.4 | tiled |
+
+Use it when a canvas is only a little bigger than one tile: tiling it costs time and, at high denoise, can give each tile its own copy of the subject. It also needs ComfyUI's own memory estimate to say the single pass fits, so it never trades a crash for speed. The choice is made once per run, and the console says which way it went. Leave it at `0` if you tile small canvases on purpose, e.g. to render every region at the model's native tile size. `2` is a good starting value.
 
 **Tile arrangement:** divide the input's pixel dimensions by the number of columns/rows you want and feed the results to `tile_width`/`tile_height` (a [Math Expression](https://github.com/pythongosssss/ComfyUI-Custom-Scripts#math-expression) node works well).
 

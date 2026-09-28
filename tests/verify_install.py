@@ -48,7 +48,7 @@ def main():
 
     suites = ["test_gaussian_weights.py", "test_flux2_packed_resample.py",
               "test_grid_bbox_weight_clamp.py", "test_ref_resample_cache.py",
-              "test_td_diag_run_tick.py", "test_qwen21_rope.py"]
+              "test_td_diag_run_tick.py", "test_qwen21_rope.py", "test_dynamic_tiling.py"]
     failures = 0
     import_error = None
     for name in suites:

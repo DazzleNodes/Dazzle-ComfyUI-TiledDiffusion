@@ -31,6 +31,13 @@ _TD_REF_NO_SLICE = os.environ.get("TD_REF_NO_SLICE", "0") == "1"
 # restart ComfyUI to change.
 _TD_DIAG = os.environ.get("TD_DIAG", "0") == "1"
 
+def _sampling_print(msg):
+    # For messages printed during sampling: the sampler's progress bar redraws
+    # in place with no trailing newline, so start on a fresh line instead of
+    # gluing onto the bar ("...it/s][TiledDiffusion] ...").
+    print("\n" + msg)
+
+
 def _td_mem_snapshot():
     try:
         if torch.cuda.is_available():
@@ -151,6 +158,33 @@ def _detect_rope_flavour(diffusion_model):
     return flavour, (is_flux_like or is_qwen_like or is_qwen21_like)
 
 
+def _dynamic_single_pass(limit, canvas_cells, tile_cells, need_bytes, free_bytes):
+    """
+    dynamic_tiling decision: run one untiled pass instead of tiling?
+    Returns (single_pass, reason).
+
+    Both gates must pass: the canvas is at most `limit` tiles' worth of area,
+    AND ComfyUI's own fit check (the one _calc_cond_batch uses for batching:
+    memory_required * 1.5 < free memory). Memory alone is not enough -- a 4K
+    canvas can "fit" by that estimate and still need tiling for speed and
+    quality; the size gate keeps big canvases tiled.
+    """
+    if not limit or limit <= 0:
+        return False, "off"
+    if not tile_cells or tile_cells <= 0:
+        return False, "tile size unknown"
+    tiles_worth = canvas_cells / tile_cells
+    if tiles_worth > limit:
+        return False, f"{tiles_worth:.1f} tiles' worth > limit {limit:g}"
+    if need_bytes is None or free_bytes is None:
+        return False, "memory estimate unavailable"
+    if need_bytes * 1.5 >= free_bytes:
+        return False, (f"{tiles_worth:.1f} tiles' worth, but needs ~{need_bytes * 1.5 / 2**30:.1f} GB "
+                       f"(with ComfyUI's 1.5x margin) vs {free_bytes / 2**30:.1f} GB free")
+    return True, (f"{tiles_worth:.1f} tiles' worth <= limit {limit:g}, needs ~{need_bytes * 1.5 / 2**30:.1f} GB "
+                  f"of {free_bytes / 2**30:.1f} GB free")
+
+
 def _disable_qwen21_prefix_cache(model_options, diffusion_model):
     """
     Turn off Qwen-Image 2.1's prefix K/V cache on our patched clone.
@@ -234,7 +268,7 @@ def _install_qwen21_rope_patch(diffusion_model):
         ids, raw = captured.get('ids'), captured.get('raw')
         if ids is None or not torch.equal(raw.transpose(1, 2).contiguous(), pe):
             diffusion_model._td_qwen21_layout_bad = True
-            print("[TiledDiffusion] Qwen-Image 2.1 RoPE patch: unexpected position layout "
+            _sampling_print("[TiledDiffusion] Qwen-Image 2.1 RoPE patch: unexpected position layout "
                   "(upstream model changed?) -- per-tile global RoPE disabled for this model.")
             return hidden_states, pe, segments
 
@@ -339,6 +373,10 @@ class AbstractDiffusion:
         self.tile_height: int = None
         self.tile_overlap: int = None
         self.tile_batch_size: int = None
+        # dynamic_tiling: 0 = off; N > 0 = single untiled pass when the canvas is
+        # at most N tiles' worth of area and fits in memory. Decided once per run.
+        self.dynamic_tiling: float = 0.0
+        self._dyn_decision = None  # (canvas shape, single_pass) for the current run
 
         # cache. final result of current sampling step, [B, C=4, H//8, W//8]
         # avoiding overhead of creating new tensors and weight summing
@@ -472,7 +510,7 @@ class AbstractDiffusion:
         # apply()-configured attrs must survive a mid-run canvas refresh
         keep = {k: getattr(self, k) for k in (
             'rope_per_tile', 'rope_flavour', 'patch_size', 'rope_scale',
-            'diffusion_model_ref', 'structure_latent') if hasattr(self, k)}
+            'diffusion_model_ref', 'structure_latent', 'dynamic_tiling') if hasattr(self, k)}
         self.__init__()
         self.latent_is_packed_2x2 = packed
         self.seam_bias_x = seam_bias_x
@@ -586,7 +624,7 @@ class AbstractDiffusion:
         self._refs_logged = True
         shapes = ", ".join("x".join(str(d) for d in e.shape) for e in refs if isinstance(e, torch.Tensor))
         packed = " (packed 2x2 latent; unpacked-space resample)" if getattr(self, 'latent_is_packed_2x2', False) else ""
-        print(f"[TiledDiffusion] ref_latents: {len(refs)} reference(s) per tile [{shapes}]{packed}")
+        _sampling_print(f"[TiledDiffusion] ref_latents: {len(refs)} reference(s) per tile [{shapes}]{packed}")
 
     def _resample_ref_to_canvas(self, e: 'Tensor', x_in: 'Tensor') -> 'Tensor':
         """Make a reference latent canvas-resolution so per-tile slicing aligns.
@@ -638,7 +676,7 @@ class AbstractDiffusion:
         if abs(ref_aspect - can_aspect) / can_aspect > 0.02:
             if key not in self._ref_resample_warned:
                 self._ref_resample_warned.add(key)
-                print(f"[TiledDiffusion] Reference latent {ref_h}x{ref_w} aspect differs "
+                _sampling_print(f"[TiledDiffusion] Reference latent {ref_h}x{ref_w} aspect differs "
                       f"from canvas {can_h}x{can_w}; treating it as a non-spatial "
                       f"(edit/Kontext) reference -- broadcast to every tile, not spatially "
                       f"tiled. If it was meant as a structural guide, match the canvas aspect ratio.")
@@ -669,7 +707,7 @@ class AbstractDiffusion:
             tip = (f" Tip: at this scale (x{cf:.1f}) latent resampling softens fine detail and "
                    f"can moire texture-dense regions at high CFG -- the pixel-space route avoids it."
                    if cf >= 2.0 else "")
-            print(f"[TiledDiffusion] Reference latent {ref_h}x{ref_w} != canvas {can_h}x{can_w}; "
+            _sampling_print(f"[TiledDiffusion] Reference latent {ref_h}x{ref_w} != canvas {can_h}x{can_w}; "
                   f"resampling to canvas resolution so per-tile slices stay spatially aligned. "
                   f"For best quality supply a canvas-resolution reference "
                   f"(decode -> image upscale -> re-encode at target dims).{tip}")
@@ -761,20 +799,58 @@ class AbstractDiffusion:
             c_tile['ref_latents_method'] = "index_timestep_zero"
 
     def _td_diag_run_tick(self, t_in: Tensor):
-        # TD_DIAG run-boundary detector: sigmas only decrease within a sampling
-        # run, so an increase vs the previous call means a new run started.
-        # (init_grid_bbox only fires on resolution change, so it cannot serve
-        # as the per-run memory probe -- this can.)
-        if not _TD_DIAG:
-            return
+        # Run-boundary detector: sigmas only decrease within a sampling run, so
+        # an increase vs the previous call means a new run started. Tracked
+        # always (dynamic_tiling decides once per run); prints only under
+        # TD_DIAG. (init_grid_bbox only fires on resolution change, so it
+        # cannot serve as the per-run probe -- this can.)
+        self._td_new_run = False
         try:
             cur = float(t_in.max())
         except Exception:
             return
         last = getattr(self, '_td_diag_last_sigma', None)
         if last is None or cur > last:
-            print(f"[TD-DIAG] run-start: sigma={cur:.4f} | {_td_mem_snapshot()}")
+            self._td_new_run = True
+            if _TD_DIAG:
+                _sampling_print(f"[TD-DIAG] run-start: sigma={cur:.4f} | {_td_mem_snapshot()}")
         self._td_diag_last_sigma = cur
+
+    def _maybe_single_pass(self, model_function, x_in: Tensor, t_in: Tensor, c_in: dict):
+        """dynamic_tiling: run the whole canvas in one untiled pass when the
+        per-run decision says so; returns the output, or None to tile."""
+        if not self.dynamic_tiling or self.dynamic_tiling <= 0:
+            return None
+        shape = tuple(x_in.shape[-2:])
+        if (getattr(self, '_td_new_run', False) or self._dyn_decision is None
+                or self._dyn_decision[0] != shape):
+            if getattr(self, 'structure_latent', None) is not None:
+                single, reason = False, "structure_latent is set (it only works per tile)"
+            else:
+                need = free = None
+                try:
+                    base = model_function.__self__
+                    cond_shapes = {}
+                    for k in getattr(base, 'memory_usage_factor_conds', ()):
+                        v = c_in.get(k)
+                        if v is None:
+                            continue
+                        cond_shapes[k] = [t.shape for t in v] if isinstance(v, (list, tuple)) else [v.shape]
+                    need = base.memory_required(list(x_in.shape), cond_shapes=cond_shapes)
+                    patcher = getattr(base, 'current_patcher', None)
+                    free = (patcher.get_free_memory(x_in.device) if patcher is not None
+                            else comfy.model_management.get_free_memory(x_in.device))
+                except Exception as e:
+                    _sampling_print(f"[TiledDiffusion] Dynamic tiling: memory estimate failed ({e}); tiling.")
+                tile_cells = (self.tile_width or 0) * (self.tile_height or 0)
+                single, reason = _dynamic_single_pass(self.dynamic_tiling, shape[0] * shape[1],
+                                                      tile_cells, need, free)
+            self._dyn_decision = (shape, single)
+            _sampling_print(f"[TiledDiffusion] Dynamic tiling: canvas {shape[1]}x{shape[0]} latent -> "
+                  f"{'single untiled pass' if single else 'tiling'} ({reason}).")
+        if self._dyn_decision[1]:
+            return model_function(x_in, t_in, **c_in)
+        return None
 
     def init_grid_bbox(self, tile_w:int, tile_h:int, overlap:int, tile_bs:int):
         # if self._init_grid_bbox is not None: return
@@ -798,11 +874,11 @@ class AbstractDiffusion:
         # init) so users can see the tiling plan -- how many tiles, what size,
         # and the batch -- without guessing. Latent units.
         _name = {'MixtureOfDiffusers': 'Mixture of Diffusers'}.get(self.method, self.method)
-        print(f"[TiledDiffusion] {_name}: canvas {self.w}x{self.h} latent, "
+        _sampling_print(f"[TiledDiffusion] {_name}: canvas {self.w}x{self.h} latent, "
               f"{self.num_tiles} tiles {self.tile_w}x{self.tile_h} "
               f"(overlap {overlap}), batch {self.tile_bs} -> {self.num_batches} forward(s)/step")
         if _TD_DIAG:
-            print(f"[TD-DIAG] run-init: {_td_mem_snapshot()}")
+            _sampling_print(f"[TD-DIAG] run-init: {_td_mem_snapshot()}")
 
     # detached version of above
     @grid_bbox
@@ -1067,6 +1143,9 @@ class MultiDiffusion(AbstractDiffusion):
         c_in: dict = args["c"]
         cond_or_uncond: List = args["cond_or_uncond"]
         self._td_diag_run_tick(t_in)
+        single = self._maybe_single_pass(model_function, x_in, t_in, c_in)
+        if single is not None:
+            return single
 
         N = x_in.shape[0]
         H, W = x_in.shape[-2:]
@@ -1203,6 +1282,9 @@ class SpotDiffusion(AbstractDiffusion):
         c_in: dict = args["c"]
         cond_or_uncond: List = args["cond_or_uncond"]
         self._td_diag_run_tick(t_in)
+        single = self._maybe_single_pass(model_function, x_in, t_in, c_in)
+        if single is not None:
+            return single
 
         N = x_in.shape[0]
         H, W = x_in.shape[-2:]
@@ -1398,6 +1480,9 @@ class MixtureOfDiffusers(AbstractDiffusion):
         t_in: Tensor = args["timestep"]
         c_in: dict = args["c"]
         cond_or_uncond: List= args["cond_or_uncond"]
+        single = self._maybe_single_pass(model_function, x_in, t_in, c_in)
+        if single is not None:
+            return single
 
         N = x_in.shape[0]
         H, W = x_in.shape[-2:]
@@ -1550,6 +1635,7 @@ class TiledDiffusion():
                                 "rope_scale": ("FLOAT", {"default": 1.0, "min": 0.25, "max": 4.0, "step": 0.05, "tooltip": "DyPE-style RoPE frequency scale. Set >1 when rendering above training resolution (e.g. 2.0 for 2x training res on Flux). 1.0 = off. Composes with per-tile shift. Ignored if an external DyPE node already sets scale_x/scale_y."}),
                                 "seam_bias_y": ("FLOAT", {"default": 0.0, "min": -1.5, "max": 1.5, "step": 0.05, "tooltip": "Experimental (Mixture of Diffusers only): shifts each tile's blend-weight peak DOWN by this many latent cells. 0 = mathematically centered weights. A small positive value (~0.5) acts as a tie-breaker that can restore coherence in full-denoise tiled generation at the cost of slightly asymmetric seams."}),
                                 "seam_bias_x": ("FLOAT", {"default": 0.0, "min": -1.5, "max": 1.5, "step": 0.05, "tooltip": "Experimental (Mixture of Diffusers only): shifts each tile's blend-weight peak RIGHT by this many latent cells. See seam_bias_y."}),
+                                "dynamic_tiling": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 16.0, "step": 0.25, "tooltip": "0 = off (always tile). N > 0: render the whole canvas in one untiled pass when it is at most N tiles' worth of area (canvas W x H / tile W x H) AND fits in memory (ComfyUI's own estimate). Example, N = 2 with 1024px tiles: 1536x1024 (1.5) = one pass; 2048x1536 (3.0) = tiled. Faster, and avoids duplicated subjects when a canvas is only a little bigger than one tile. 2 is a good start. Decided once per run; the console says which way it went. Leave at 0 if you tile small canvases on purpose."}),
                                 "structure_latent": ("LATENT", {"tooltip": "Optional structural prior for non-CN T2I tile coherence. Wire a LATENT (typically: low-res non-tiled KSampler -> VAE Decode -> ImageScale to target dims -> VAE Encode) to provide per-tile spatial guidance via the model's ref_latents conditioning channel. Tiles each see the spatially-aligned slice of this latent. Composes with rope_patch and ControlNet. Best on RoPE DiT models (Qwen-Image, Flux). See README 'Pure-T2I tile coherence on Qwen-Image'."}),
                             }}
     RETURN_TYPES = ("MODEL",)
@@ -1570,7 +1656,7 @@ class TiledDiffusion():
     def __init__(self) -> None:
         self.__class__.instances.add(self)
 
-    def apply(self, model: ModelPatcher, method, tile_width, tile_height, tile_overlap, tile_batch_size, rope_patch="auto", rope_scale=1.0, seam_bias_y=0.0, seam_bias_x=0.0, structure_latent=None):
+    def apply(self, model: ModelPatcher, method, tile_width, tile_height, tile_overlap, tile_batch_size, rope_patch="auto", rope_scale=1.0, seam_bias_y=0.0, seam_bias_x=0.0, structure_latent=None, dynamic_tiling=0.0):
         if method == "Mixture of Diffusers":
             self.impl = MixtureOfDiffusers()
         elif method == "MultiDiffusion":
@@ -1628,6 +1714,7 @@ class TiledDiffusion():
         # Seam-bias tie-breaker (MoD blend weights only; harmless no-op elsewhere)
         self.impl.seam_bias_x = float(seam_bias_x)
         self.impl.seam_bias_y = float(seam_bias_y)
+        self.impl.dynamic_tiling = float(dynamic_tiling)
         self.impl.diffusion_model_ref = weakref.ref(diffusion_model) if diffusion_model is not None else None
 
         if enable_rope and rope_flavour == "qwen" and diffusion_model is not None:
