@@ -21,7 +21,7 @@ Large-image drawing & upscaling with limited VRAM — extended for the DiT era. 
 - **Per-tile global RoPE** (`rope_patch`) — fixes the seams DiT models produce when every tile restarts its positions at (0,0); auto-detected for Flux-family, Qwen-Image-Edit, and Qwen-Image 2.1
 - **Reference-latent tiling** — each tile attends only to its spatially-aligned slice of the reference; non-canvas references are resampled correctly (packed-latent-aware on Flux.2)
 - **Correct tile sizes on every model** — widget pixels convert via the model's own latent format (Flux.2 is 16 px/cell; earlier builds assumed 8 everywhere, silently making Flux.2 tiles 4x heavier)
-- **ControlNet support** incl. Wan-family VAEs (5-D latent hints, tuple `downscale_ratio`)
+- **ControlNet support** incl. Wan-family VAEs (5-D latent hints, tuple `downscale_ratio`) and Qwen-Image 2.1's Fun ControlNet Union (control image encoded once, cropped per tile)
 - Img2img upscale, ultra-large generation, `structure_latent` experimental input
 
 ## Installation
@@ -42,6 +42,8 @@ Verify the install (prints your code version and runs the regression tests): `py
 **Upscale anything (Hi-Res Fix recipe — recommended):** low-res pass at the model's training resolution → pixel-space upscale to target → `VAE Encode` → `KSampler` at **partial denoise** with the `TiledDiffusion`-patched model. The `denoise` value is the lever: `~0.025` pure polish (composition untouched), `~0.18` fine detail (structure locked), `~0.28-0.42` more inventive, above `~0.6-0.8` tiles start forgetting the structure. Ready-to-load graph: [docs/examples/hires-fix-tiled-refine.json](docs/examples/hires-fix-tiled-refine.json).
 
 **Reference-guided tiling (Flux.2 / Kontext / Qwen-Image-Edit):** wire your reference through `ReferenceLatent` as usual and sample full-denoise with the patched model — each tile sees its aligned slice of the reference. Ready-to-load graph: [docs/examples/flux2-ref-tiled-upscale.json](docs/examples/flux2-ref-tiled-upscale.json).
+
+**ControlNet-guided tiling (Qwen-Image 2.1 Fun ControlNet Union):** chain `Apply Fun ControlNet` before the patched model as usual; Tiled Diffusion encodes each control image once at full canvas and gives every tile its own crop (`tile_batch_size` is forced to 1 while Fun ControlNets are present). Ready-to-load graph: [docs/examples/qwen21-fun-controlnet-tiled-refine.json](docs/examples/qwen21-fun-controlnet-tiled-refine.json).
 
 > [!TIP]
 > * Set `tile_overlap` to 0 and `denoise` to 1 to see the tile seams, then adjust to your needs.

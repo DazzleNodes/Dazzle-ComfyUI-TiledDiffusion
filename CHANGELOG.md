@@ -2,6 +2,16 @@
 
 All notable changes to this fork are documented here. Versioning begins at 0.2.0 (2026-07-02); the fork's earlier work — per-tile global RoPE for Flux/Qwen-Image-Edit, list-of-tensor reference-latent conditioning, Wan-family-VAE-aware ControlNet hint slicing, the reference resample-to-canvas fix, profiling tooling — predates versioning and is treated as the implicit 0.1.x line; see `git log` for that history.
 
+## [0.3.1] - 2026-10-22
+
+### Fixed
+
+- **Qwen-Image 2.1 Fun ControlNet tore the image apart under tiling.** ComfyUI's Fun ControlNet patch ("Apply Fun ControlNet") builds its control image at whatever size the model is called with. Under tiling that is one tile, so every tile got the *whole* pose / depth / canny image squashed into it, and the figure came out ghosted and duplicated. Tiled Diffusion now encodes each control image once at full canvas per run and gives every tile its own crop (SpotDiffusion's per-step shift included). Chained Fun ControlNets (several applies) are all handled. `tile_batch_size` is forced to 1 while Fun ControlNets are present, because the patch holds one control image per model call. If a future ComfyUI changes how the patch builds its control image so the crop is no longer used, the console prints a warning instead of silently distorting. Verified on a 2x2-tile render with three chained Fun ControlNets (pose, depth, canny): the tiled result matches the untiled reference in composition.
+
+### Added
+
+- Example workflow `docs/examples/qwen21-fun-controlnet-tiled-refine.json`: a tiled Qwen-Image 2.1 refine held by the Fun ControlNet Union (core nodes plus Tiled Diffusion only), with README entries.
+
 ## [0.3.0] - 2026-09-28
 
 ### Added

@@ -1,12 +1,13 @@
 # Example Workflows
 
-Three minimal workflows covering the node's two canonical patterns. Both use Flux.2 loaders — swap the three loader nodes for any supported model family (the Hi-Res Fix pattern is model-agnostic; drop `FluxGuidance` for non-Flux models).
+Four minimal workflows. The first three cover the node's two canonical patterns with Flux.2 loaders — swap the three loader nodes for any supported model family (the Hi-Res Fix pattern is model-agnostic; drop `FluxGuidance` for non-Flux models). The fourth is ControlNet-guided tiling on Qwen-Image 2.1.
 
 | File | Pattern | For |
 |---|---|---|
 | `hires-fix-tiled-refine.json` | Structure-in-latent, partial denoise | Everything, incl. base models — the recommended upscale recipe |
 | `flux2-ref-tiled-upscale-pixelspace.json` | Reference-guided, full denoise, **pixel-space ref (best quality)** | Edit/ref-trained models (Flux.2, Flux Kontext, Qwen-Image-Edit) |
 | `flux2-ref-tiled-upscale.json` | Reference-guided, full denoise, latent-resampled ref | Same — doubles as a smoke test of the v0.2.0 packed resample |
+| `qwen21-fun-controlnet-tiled-refine.json` | ControlNet-guided refine, partial denoise | Qwen-Image 2.1 with the Fun ControlNet Union (canny here; any of its 8 condition types) |
 
 ## hires-fix-tiled-refine.json
 
@@ -54,3 +55,22 @@ The same two-stage graph, but the reference is upscaled as an IMAGE before re-en
 | `UNETLoader` | `flux2_dev_fp8mixed.safetensors` (any Flux.2 dev; for `.gguf` swap in a GGUF UNet loader) |
 | `CLIPLoader` (type `flux2`) | `mistral_3_small_flux2_fp8.safetensors` |
 | `VAELoader` | `flux2-vae.safetensors` |
+
+## qwen21-fun-controlnet-tiled-refine.json
+
+A tiled refine of any image on Qwen-Image 2.1, with the Fun ControlNet Union holding its structure. Load an image, it is scaled to ~3 MP, a Canny edge map is taken from it, and Qwen 2.1 re-renders it at **denoise 0.6** through Tiled Diffusion (Mixture of Diffusers, 1408 px tiles, 384 overlap). Core nodes plus Tiled Diffusion only.
+
+**What Tiled Diffusion does for the Fun ControlNet (v0.3.1+):** the control image is encoded **once at full canvas** and each tile gets **its own crop**. Before that, every tile got the whole control image squashed into it and the figure tore into ghosted fragments. `tile_batch_size` is forced to 1 while Fun ControlNets are present, because the patch holds one control image per model call. Several *Apply Fun ControlNet* nodes can be chained (pose + depth + canny, say); every one is cropped per tile.
+
+**Console line you should see:** `[TiledDiffusion] Qwen-Image 2.1 Fun ControlNet: 1 control patch(es) found; encoding the control image once at full canvas and cropping it per tile.` There should be no `WARNING ... did not use the per-tile crop` line.
+
+**ControlNet window:** ComfyUI's `start_percent` / `end_percent` are on the model's whole schedule, not the denoise window. For the ControlNet to be on for a fraction of *your run*, use `percent = (1 - denoise) + run_fraction x denoise`. The workflow ships on from 2% to 70% of a denoise-0.6 run: start `0.412`, end `0.82`.
+
+**Models required** (Comfy-Org/Qwen-Image-2.1; pick your precision tier in the four loaders):
+
+| Loader | Example file |
+|---|---|
+| `UNETLoader` | `qwen_image_2.1_int8_convrot.safetensors` |
+| `CLIPLoader` (type `qwen_image`) | `qwen3vl_8b_int8_convrot.safetensors` |
+| `VAELoader` | `qwen_image_2.1_vae_bf16.safetensors` |
+| `ModelPatchLoader` | `qwen_image_2.1_fun_controlnet_union_int8_convrot.safetensors` (alibaba-pai) |

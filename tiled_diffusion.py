@@ -185,6 +185,30 @@ def _dynamic_single_pass(limit, canvas_cells, tile_cells, need_bytes, free_bytes
                   f"of {free_bytes / 2**30:.1f} GB free")
 
 
+def _collect_fun_control_patches(transformer_options):
+    """
+    Qwen-Image 2.1 Fun ControlNet patches reachable from transformer_options.
+
+    The core patch (comfy_extras/nodes_model_patch.py, QwenImage21FunControlPatch)
+    registers block patches under patches_replace["dit"][("single_block", i)],
+    each holding .control_patch and chaining earlier applies via .previous.
+    Duck-typed on prepare/control/diffusion_model_wrapper, which only that class
+    has. Returns distinct patches in first-seen order.
+    """
+    dit = ((transformer_options or {}).get("patches_replace", {}) or {}).get("dit", {}) or {}
+    found, seen_ids, walked = [], set(), set()
+    for p in dit.values():
+        while p is not None and id(p) not in walked:
+            walked.add(id(p))
+            cp = getattr(p, "control_patch", None)
+            if (cp is not None and id(cp) not in seen_ids and hasattr(cp, "prepare")
+                    and hasattr(cp, "control") and hasattr(cp, "diffusion_model_wrapper")):
+                seen_ids.add(id(cp))
+                found.append(cp)
+            p = getattr(p, "previous", None)
+    return found
+
+
 def _disable_qwen21_prefix_cache(model_options, diffusion_model):
     """
     Turn off Qwen-Image 2.1's prefix K/V cache on our patched clone.
@@ -377,6 +401,11 @@ class AbstractDiffusion:
         # at most N tiles' worth of area and fits in memory. Decided once per run.
         self.dynamic_tiling: float = 0.0
         self._dyn_decision = None  # (canvas shape, single_pass) for the current run
+        # Qwen-Image 2.1 Fun ControlNet: full-canvas control per patch for this run
+        self._fun_full = {}       # id(patch) -> (patch, (h, w), full control, cpu float)
+        self._fun_patches = []
+        self._fun_crops = []
+        self._fun_guard_done = True
 
         # cache. final result of current sampling step, [B, C=4, H//8, W//8]
         # avoiding overhead of creating new tensors and weight summing
@@ -738,6 +767,85 @@ class AbstractDiffusion:
             self._ref_resample_cache.pop(next(iter(self._ref_resample_cache)))
         self._ref_resample_cache[ckey] = (fp.clone(), out)
         return out
+
+    def _prepare_fun_controlnet(self, c_in: dict) -> None:
+        """
+        Qwen-Image 2.1 Fun ControlNet: find its patches for this call. The patch
+        builds its control latent at whatever size the model is called with, so
+        under tiling every tile would get the WHOLE control image squashed into
+        it (ghosted, duplicated figures). We encode it once per run at the full
+        canvas and hand each tile its crop (_inject_fun_controlnet).
+
+        The patch holds one control tensor, so tiles must run one per model
+        call: a tile batch > 1 is dropped to 1 here, before the grid is built.
+        """
+        if getattr(self, '_td_new_run', False):
+            self._fun_full = {}
+            self._fun_guard_done = False
+            # announce once per RUN: the node's impl survives re-queued runs when
+            # ComfyUI caches the TiledDiffusion node, so a per-impl flag goes quiet
+            self._fun_announced = False
+        self._fun_patches = _collect_fun_control_patches(c_in.get('transformer_options'))
+        if not self._fun_patches:
+            return
+        if not getattr(self, '_fun_announced', False):
+            self._fun_announced = True
+            _sampling_print(f"[TiledDiffusion] Qwen-Image 2.1 Fun ControlNet: {len(self._fun_patches)} control "
+                            f"patch(es) found; encoding the control image once at full canvas and cropping it per tile.")
+        if self.tile_batch_size and self.tile_batch_size != 1:
+            _sampling_print(f"[TiledDiffusion] Fun ControlNet holds one control image per model call: "
+                            f"forcing tile_batch_size=1 (was {self.tile_batch_size}).")
+            self.tile_batch_size = 1
+            self.weights = None  # rebuild the grid with batch 1 on this call
+
+    def _inject_fun_controlnet(self, bboxes: 'List[BBox]', roll=None) -> None:
+        """Set each Fun patch's control to this tile's crop of the full-canvas
+        control. The crop's shape equals the tile's, so the patch's own
+        prepare() returns early instead of re-encoding (nodes_model_patch.py
+        QwenImage21FunControlPatch.prepare). `roll` mirrors SpotDiffusion's
+        canvas shift."""
+        patches = getattr(self, '_fun_patches', None)
+        if not patches:
+            return
+        if len(bboxes) != 1:  # _prepare_fun_controlnet forces batch 1; never feed a wrong crop
+            return
+        bbox = bboxes[0]
+        self._fun_crops = []
+        for patch in patches:
+            entry = self._fun_full.get(id(patch))
+            if entry is None or entry[0] is not patch or entry[1] != (self.h, self.w):
+                pause = getattr(comfy.model_prefetch, 'pause_malloc_graph', None) if hasattr(comfy, 'model_prefetch') else None
+                if pause is not None:
+                    with pause():
+                        patch.prepare(self.h, self.w)
+                else:
+                    patch.prepare(self.h, self.w)
+                entry = (patch, (self.h, self.w), patch.control.float().cpu())
+                self._fun_full[id(patch)] = entry
+            full = entry[2]
+            if roll is not None:
+                full = roll(full)
+            crop = full[bbox.slicer].contiguous()
+            patch.control = crop
+            self._fun_crops.append((patch, crop))
+
+    def _check_fun_controlnet(self) -> None:
+        """Once per run, after an active tile call: confirm the patch used our
+        crop. If a core change makes prepare() re-encode anyway, the control
+        no longer matches -- say so loudly instead of silently re-squashing."""
+        if getattr(self, '_fun_guard_done', True) or not getattr(self, '_fun_crops', None):
+            return
+        for patch, crop in self._fun_crops:
+            if not getattr(patch, 'active', False):
+                continue  # outside its sigma window: prepare() didn't run, nothing to check yet
+            self._fun_guard_done = True
+            c = patch.control
+            if c is None or tuple(c.shape) != tuple(crop.shape) or not torch.allclose(
+                    c.float().cpu(), crop, atol=0.05, rtol=0.05):
+                _sampling_print("[TiledDiffusion] WARNING: Qwen-Image 2.1 Fun ControlNet did not use the per-tile "
+                                "crop (core prepare() changed?). Control will be distorted under tiling; "
+                                "render untiled or update TiledDiffusion.")
+            return
 
     def _inject_structure_latent(self, c_tile: dict, x_tile: 'Tensor', x_in: 'Tensor', bboxes: 'List[BBox]') -> None:
         """
@@ -1146,6 +1254,7 @@ class MultiDiffusion(AbstractDiffusion):
         single = self._maybe_single_pass(model_function, x_in, t_in, c_in)
         if single is not None:
             return single
+        self._prepare_fun_controlnet(c_in)
 
         N = x_in.shape[0]
         H, W = x_in.shape[-2:]
@@ -1229,8 +1338,10 @@ class MultiDiffusion(AbstractDiffusion):
 
                 # Optional per-tile structure_latent injection (non-CN coherence anchor).
                 self._inject_structure_latent(c_tile, x_tile, x_in, bboxes)
+                self._inject_fun_controlnet(bboxes)
 
                 x_tile_out = model_function(x_tile, t_tile, **c_tile)
+                self._check_fun_controlnet()
 
                 for i, bbox in enumerate(bboxes):
                     self.x_buffer[bbox.slicer] += x_tile_out[i*N:(i+1)*N]
@@ -1285,6 +1396,7 @@ class SpotDiffusion(AbstractDiffusion):
         single = self._maybe_single_pass(model_function, x_in, t_in, c_in)
         if single is not None:
             return single
+        self._prepare_fun_controlnet(c_in)
 
         N = x_in.shape[0]
         H, W = x_in.shape[-2:]
@@ -1335,15 +1447,18 @@ class SpotDiffusion(AbstractDiffusion):
         if min(self.tile_width, x_in.shape[-1]) == x_in.shape[-1]:
             sh_w=0
         condition = cur_i % 2 == 0 if self.tile_height > self.tile_width else cur_i % 2 != 0
+        # the exact roll applied to x_in this step, so per-tile crops can follow it
+        spot_roll = None
         if (sh_h,sh_w) != (0,0):
             # x_in = x_in.roll(shifts=(sh_h,sh_w), dims=(-2,-1))
             if sh_h == 0 or sh_w == 0:
-                x_in = x_in.roll(shifts=(sh_h,sh_w), dims=(-2,-1))
+                spot_roll = lambda t: t.roll(shifts=(sh_h,sh_w), dims=(-2,-1))
             else:
                 if condition:
-                    x_in = x_in.roll(shifts=sh_h, dims=-2)
+                    spot_roll = lambda t: t.roll(shifts=sh_h, dims=-2)
                 else:
-                    x_in = x_in.roll(shifts=sh_w, dims=-1)
+                    spot_roll = lambda t: t.roll(shifts=sh_w, dims=-1)
+            x_in = spot_roll(x_in)
 
         # Background sampling (grid bbox)
         if self.draw_background:
@@ -1413,8 +1528,10 @@ class SpotDiffusion(AbstractDiffusion):
 
                 # Optional per-tile structure_latent injection (non-CN coherence anchor).
                 self._inject_structure_latent(c_tile, x_tile, x_in, bboxes)
+                self._inject_fun_controlnet(bboxes, roll=spot_roll)
 
                 x_tile_out = model_function(x_tile, t_tile, **c_tile)
+                self._check_fun_controlnet()
 
                 for i, bbox in enumerate(bboxes):
                     self.x_buffer[bbox.slicer] = x_tile_out[i*N:(i+1)*N]
@@ -1483,6 +1600,7 @@ class MixtureOfDiffusers(AbstractDiffusion):
         single = self._maybe_single_pass(model_function, x_in, t_in, c_in)
         if single is not None:
             return single
+        self._prepare_fun_controlnet(c_in)
 
         N = x_in.shape[0]
         H, W = x_in.shape[-2:]
@@ -1586,6 +1704,7 @@ class MixtureOfDiffusers(AbstractDiffusion):
                 # Optional per-tile structure_latent injection (non-CN coherence anchor).
                 if _TD_PROFILE: _t = time.perf_counter()
                 self._inject_structure_latent(c_tile, x_tile, x_in, bboxes)
+                self._inject_fun_controlnet(bboxes)
                 if _TD_PROFILE: prof['slat'] += time.perf_counter() - _t
 
                 # denoising: here the x is the noise
@@ -1596,6 +1715,7 @@ class MixtureOfDiffusers(AbstractDiffusion):
                     if x_tile.is_cuda: torch.cuda.synchronize()
                     _t = time.perf_counter()
                 x_tile_out = model_function(x_tile, t_tile, **c_tile)
+                self._check_fun_controlnet()
                 if _TD_PROFILE:
                     if x_tile.is_cuda: torch.cuda.synchronize()
                     prof['model'] += time.perf_counter() - _t
